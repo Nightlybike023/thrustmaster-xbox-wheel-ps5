@@ -41,8 +41,25 @@ https://github.com/user-attachments/assets/6583b1c2-3d3d-4f2e-9e79-689121fea4a3
 |-----------|------|---------|--------|
 | 8BitDo Ultimate 2 | Nintendo Switch Pro | 057e:2009 | ✅ Working |
 | 8BitDo Ultimate 2 | Native | 2dc8:310b | Untested |
+| Thrustmaster Ferrari 458 Spider | Xbox One GIP | 044f:b674 | ✅ Working (Steering, Pedals, Paddles) |
 
 See `othercontrollersGuide.md` for adding new controllers.
+
+---
+
+## 🏎️ Web Telemetry & Cockpit Overlay
+
+The payload embeds an ultra-lightweight HTTP server on port `8088`:
+- `http://<PS5_IP>:8088/` — Live calibration UI (deadzone, linearity, sensitivity, gear alignment).
+- `http://<PS5_IP>:8088/overlay` — Real-time cockpit dashboard showing steering angle (±120°), pedal pressure (R2/L2), gear indicator, paddle shifters, and RPM shift lights.
+
+### 🎮 Interactive HTML Demo (No PS5 required)
+You can test and preview the cockpit overlay directly in any web browser:
+Open [`overlay-demo.html`](./overlay-demo.html) in your browser:
+- **▶ Auto Demo**: Simulates a realistic racing lap with acceleration, braking, gear shifting, and smooth steering.
+- **🎮 Manual / Keyboard**: Interactive sliders and keyboard controls (`W`/`A`/`S`/`D`, `Q`/`E` for paddles).
+- **🕹️ USB Gamepad**: Connect any USB/Bluetooth controller or wheel to test directly via the browser's Gamepad API.
+- **🌐 Live PS5**: Connects to the PS5 telemetry stream when running on the console.
 
 ---
 
