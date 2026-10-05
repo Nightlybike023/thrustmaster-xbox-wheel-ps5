@@ -5,10 +5,12 @@
 
 #include "controller_xbox.h"
 #include "usb_helpers.h"
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <dev/usb/usbdi.h>
 
 #ifdef __PROSPERO__
 #include <ps5/klog.h>
@@ -95,39 +97,52 @@ void xbox_parse_input(const uint8_t *b, ScePadData *o) {
 static int read_one(int fd, struct usb_fs_endpoint *eps,
                     uint8_t *buf, uint32_t timeout_ms) {
     void *b[1] = {buf}; uint32_t l[1] = {64};
-    eps[0].ppBuffer = b; eps[0].pLength = l; eps[0].nFrames   = 1;
-    eps[0].timeout  = timeout_ms; eps[0].aFrames = 0; eps[0].status = 0;
-    eps[0].flags    = USB_FS_FLAG_SINGLE_SHORT_OK | USB_FS_FLAG_MULTI_SHORT_OK;
-
-    struct usb_fs_start st; memset(&st, 0, sizeof(st)); st.ep_index = 0;
-    if (ioctl(fd, USB_FS_START, &st) != 0) return -errno;
-
+    int result = -ETIMEDOUT;
+    eps[0].ppBuffer = b; eps[0].pLength = l; eps[0].nFrames = 1;
+    eps[0].timeout = timeout_ms; eps[0].aFrames = 0; eps[0].status = 0;
+    eps[0].flags = USB_FS_FLAG_SINGLE_SHORT_OK | USB_FS_FLAG_MULTI_SHORT_OK;
+    memset(buf, 0, 64);
+    struct usb_fs_start st = {0};
+    if (ioctl(fd, USB_FS_START, &st) != 0) {
+        result = errno ? -errno : -EIO;
+        goto failed;
+    }
     int polls = (int)((timeout_ms + 300) / 50) + 1;
     for (int w = 0; w < polls; w++) {
-        struct usb_fs_complete co; memset(&co, 0, sizeof(co)); co.ep_index = 0;
+        struct usb_fs_complete co = {0};
         if (ioctl(fd, USB_FS_COMPLETE, &co) == 0) {
-            if (eps[0].aFrames == 0 || l[0] == 0) return 0;
-            return (int)l[0];
+            if (co.ep_index != 0) continue;
+            if (eps[0].status == USB_ERR_TIMEOUT) result = 0;
+            else if (eps[0].status != USB_ERR_NORMAL_COMPLETION || l[0] > 64) result = -EIO;
+            else result = eps[0].aFrames == 1 ? (int)l[0] : 0;
+            goto done;
         }
-        if (errno != EBUSY) {
-            struct usb_fs_stop sp; memset(&sp, 0, sizeof(sp)); sp.ep_index = 0;
-            ioctl(fd, USB_FS_STOP, &sp);
-            return -errno;
+        if (errno != EBUSY && errno != EINTR) {
+            result = errno ? -errno : -EIO;
+            goto failed;
         }
         usleep(50000);
     }
-    struct usb_fs_stop sp; memset(&sp, 0, sizeof(sp)); sp.ep_index = 0;
-    ioctl(fd, USB_FS_STOP, &sp);
-    return 0;
+failed:
+    {
+        struct usb_fs_stop stop = {0};
+        struct usb_fs_close close_ep = {0};
+        ioctl(fd, USB_FS_STOP, &stop);
+        ioctl(fd, USB_FS_CLOSE, &close_ep);
+    }
+done:
+    eps[0].ppBuffer = NULL;
+    eps[0].pLength = NULL;
+    return result;
 }
 
-static void send_ack(int fd, struct usb_fs_endpoint *eps, uint8_t orig_seq) {
+static int send_ack(int fd, struct usb_fs_endpoint *eps, uint8_t orig_seq) {
     uint8_t ack[8] = {GIP_CMD_ACK, 0x00, 0x00, 0x04,
                       orig_seq, GIP_CMD_ANNOUNCE, 0x00, 0x00};
-    usb_send_out(fd, &eps[1], ack, 8, "ack");
+    return usb_send_out(fd, &eps[1], ack, 8, "ack");
 }
 
-void xbox_gip_handshake(int fd, struct usb_fs_endpoint *eps) {
+int xbox_gip_handshake(int fd, struct usb_fs_endpoint *eps) {
     static const uint8_t power[] = {0x05, 0x20, 0x00, 0x01, 0x00};
     uint8_t buf[64];
     int announced = 0;
@@ -138,15 +153,16 @@ void xbox_gip_handshake(int fd, struct usb_fs_endpoint *eps) {
     for (int pass = 0; pass < 2 && !announced; pass++) {
         if (pass == 1) {
             uint8_t hello[4] = {GIP_CMD_ACK, 0x00, 0x00, 0x00};
-            usb_send_out(fd, &eps[1], hello, 4, "hello");
+            if (usb_send_out(fd, &eps[1], hello, 4, "hello") != 0) return -1;
         }
         /* Pass 0: 3 reads — if ANNOUNCE was already sent during probe, we miss it fast.
          * Pass 1: send hello to re-trigger, wait longer. Handles both direct + hub. */
         int reads = (pass == 0) ? 3 : 60;
         for (int i = 0; i < reads && !announced; i++) {
             int n = read_one(fd, eps, buf, 150);
-            if (n > 0 && buf[0] == GIP_CMD_ANNOUNCE) {
-                send_ack(fd, eps, buf[1]);
+            if (n < 0) return -1;
+            if (n >= 2 && buf[0] == GIP_CMD_ANNOUNCE) {
+                if (send_ack(fd, eps, buf[1]) != 0) return -1;
                 announced = 1;
             } else if (n > 0 && buf[0] == GIP_CMD_INPUT) {
                 announced = 1;
@@ -154,14 +170,16 @@ void xbox_gip_handshake(int fd, struct usb_fs_endpoint *eps) {
         }
     }
 
-    usb_send_out(fd, &eps[1], power, 5, "power");
+    if (usb_send_out(fd, &eps[1], power, 5, "power") != 0) return -1;
     LOG("Xbox handshake done (announced=%d)\n", announced);
+    return 0;
 }
 
 int xbox_handle_packet(int fd, struct usb_fs_endpoint *eps,
                        const uint8_t *buf, uint32_t len,
                        ScePadData *out_pad) {
     (void)fd; (void)eps;
+    if (!buf || !out_pad || len < 1 || len > 64) return 0;
     uint8_t cmd = buf[0];
 
     /* Player input */
@@ -174,7 +192,7 @@ int xbox_handle_packet(int fd, struct usb_fs_endpoint *eps,
     /* Guide button (Xbox logo): cmd=0x07, b[4]=0x01 pressed, 0x00 released.
      * Controller auto-sends this at connect — gate behind 10 INPUT packets
      * so the startup auto-send does not inject a PS button press. */
-    if (cmd == 0x07) {
+    if (cmd == 0x07 && len >= 5) {
         out_pad->connected    = 1;
         out_pad->quat.w       = 1.0f;
         out_pad->leftStick.x  = 128;
@@ -189,8 +207,8 @@ int xbox_handle_packet(int fd, struct usb_fs_endpoint *eps,
     /* Re-announce during streaming */
     if (cmd == GIP_CMD_ANNOUNCE && len >= 4) {
         static const uint8_t power[] = {0x05, 0x20, 0x00, 0x01, 0x00};
-        send_ack(fd, eps, buf[1]);
-        usb_send_out(fd, &eps[1], power, 5, "repower");
+        if (send_ack(fd, eps, buf[1]) != 0 ||
+            usb_send_out(fd, &eps[1], power, 5, "repower") != 0) return -1;
         return 0;
     }
 

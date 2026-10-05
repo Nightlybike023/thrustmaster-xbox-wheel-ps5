@@ -21,6 +21,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -31,6 +32,7 @@
 #include <dev/usb/usb.h>
 #include <dev/usb/usb_ioctl.h>
 #include <dev/usb/usb_endian.h>
+#include <dev/usb/usbdi.h>
 
 #ifdef __PROSPERO__
 #include <ps5/kernel.h>
@@ -43,11 +45,15 @@
 #include "usb_helpers.h"
 #include "controller_nintendo.h"
 #include "controller_xbox.h"
+#include "controller_wheel.h"
+#include "web_server.h"
+#include "instance_guard.h"
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
 #define LOG_DIR  "/data/ghostpad"
 #define LOG_PATH "/data/ghostpad/gc_status.log"
 #define PID_PATH "/data/ghostpad/gc_main.pid"
+#define INSTANCE_PATH "/data/ghostpad/gc_instance.lock"
 #define LOG_MAX  480
 
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -91,16 +97,16 @@ extern int32_t sceKernelSendNotificationRequest(int unk0, void *req, size_t size
 #define VIRTUAL_DEVICE_TYPE_DUALSENSE 3
 
 /* ── Multi-controller slots ───────────────────────────────────────────── */
-#define MAX_SLOTS 4
+#define MAX_SLOTS 1
 
 typedef struct {
-    volatile int32_t handle;        /* VDA handle, -1 = slot free */
-    volatile int     vdi_ready;
-    volatile int     usb_active;    /* USB reader thread is running */
-    volatile int     confirmed;     /* user pressed a button — assignment done */
+    _Atomic int32_t handle;        /* VDA handle, -1 = slot free */
+    _Atomic int     vdi_ready;
+    _Atomic int     usb_active;    /* USB reader thread is running */
+    _Atomic int     confirmed;     /* user pressed a button — assignment done */
     char             dev_path[32];  /* ugen path claimed by this slot */
     uint16_t         vid, pid;
-    volatile uint32_t inject_count;
+    _Atomic uint32_t inject_count;
 } ctrl_slot_t;
 
 static ctrl_slot_t     g_slots[MAX_SLOTS];
@@ -110,7 +116,7 @@ static int32_t         g_inject_uid = 0x10000000;
 /* Assignment serialization: only ONE controller may show its assignment
  * dialog at a time. g_assign_slot = slot awaiting user confirmation, or -1.
  * Without this, multiple dialogs stack and all bind to the same user. */
-static volatile int    g_assign_slot = -1;
+static _Atomic int     g_assign_slot = -1;
 
 /* ── klog device-ID queue ─────────────────────────────────────────────── */
 #define KLOG_QSIZE 16
@@ -169,7 +175,7 @@ static void parse_klog_line(const char *line) {
     const char *p = strstr(line, "DeviceId:0x");
     if (!p) p = strstr(line, "deviceId=0x");
     if (!p) return;
-    p += 11;
+    p += 11; /* DeviceId:0x and deviceId=0x are both 11 characters. */
     uint64_t id = parse_hex_str(p);
     if (!id) return;
     gp_log("klog: VDA device 0x%llx\n", (unsigned long long)id);
@@ -210,6 +216,7 @@ static void inject_pad(int slot, const ScePadData *pad) {
     int32_t h = g_slots[slot].handle;
     if (h < 0 || !g_slots[slot].vdi_ready) return;
     int vr = scePadVirtualDeviceInsertData(h, pad);
+    if (g_slots[slot].vid == WHEEL_VID && g_slots[slot].pid == WHEEL_PID) wheel_diagnostics_injection(vr);
     uint32_t n = ++g_slots[slot].inject_count;
     if ((n % 600) == 0)
         gp_log("slot[%d] VDI #%u ret=0x%08x\n", slot, n, (uint32_t)vr);
@@ -224,64 +231,54 @@ static void inject_pad(int slot, const ScePadData *pad) {
 #define PID_SWITCH  0x2009u
 #define VID_XBOX    0x045eu
 #define PID_XBOX    0x02eau
+#define VID_WHEEL   WHEEL_VID
+#define PID_WHEEL   WHEEL_PID
 
 static const char *UGEN_PATHS[] = {
     "/dev/ugen2.2","/dev/ugen2.3","/dev/ugen2.4","/dev/ugen2.5",
     "/dev/ugen2.6","/dev/ugen2.7","/dev/ugen2.8","/dev/ugen2.9",
-    "/dev/ugen1.2","/dev/ugen0.2","/dev/ugen0.3",
+    "/dev/ugen1.2","/dev/ugen1.3","/dev/ugen1.4","/dev/ugen1.5",
+    "/dev/ugen0.2","/dev/ugen0.3","/dev/ugen0.4","/dev/ugen0.5",
+    "/dev/ugen2.1","/dev/ugen1.1","/dev/ugen0.1",
 };
 #define N_UGEN_PATHS ((int)(sizeof(UGEN_PATHS)/sizeof(UGEN_PATHS[0])))
 
-/* Probe one ugen2.x path to identify controller type.
- * Returns 1 with vid/pid set, 0 if not a known controller.
- * Skips non-ugen2 paths (not on external USB bus). */
+/* Probe one ugen path to identify controller type.
+ * Returns 1 with vid/pid set, 0 if not a known controller. */
 static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid) {
-    if (strncmp(path, "/dev/ugen2.", 11) != 0) return 0;
+    if (strncmp(path, "/dev/ugen", 9) != 0) return 0;
 
     int fd = open(path, O_RDWR|O_NONBLOCK);
     if (fd < 0) return 0;
 
-    struct usb_fs_endpoint ep;
-    struct usb_fs_init ini;
-    struct usb_fs_uninit u;
-    memset(&ep,0,sizeof(ep)); memset(&ini,0,sizeof(ini));
-    ini.pEndpoints=&ep; ini.ep_index_max=1;
-    if (ioctl(fd,USB_FS_INIT,&ini)!=0) { close(fd); return 0; }
+    /* Verifica o dispositivo via USB_GET_DEVICE_DESC */
+    struct usb_device_descriptor desc;
+    if (ioctl(fd, USB_GET_DEVICE_DESC, &desc) == 0) {
+        uint16_t v = UGETW(desc.idVendor);
+        uint16_t p = UGETW(desc.idProduct);
 
-    int ii=0; ioctl(fd,USB_IFACE_DRIVER_DETACH,&ii);
-    ii=1;     ioctl(fd,USB_IFACE_DRIVER_DETACH,&ii);
-    ii=2;     ioctl(fd,USB_IFACE_DRIVER_DETACH,&ii);
+        /* Se for Sony (DualSense, PSVR, dongles oficiais) -> NUNCA ENCOSTAR! */
+        if (v == 0x054cu) {
+            close(fd);
+            return 0;
+        }
 
-    struct usb_fs_open po;
-    memset(&po,0,sizeof(po)); po.ep_index=0; po.max_bufsize=64; po.max_frames=1;
+        /* Se for o volante Thrustmaster Ferrari 458 Spider */
+        if (v == VID_WHEEL && p == PID_WHEEL) {
+            gp_log("probe: %s -> Thrustmaster Ferrari 458 Spider (044F:B671)!\n", path);
+            *out_vid = VID_WHEEL;
+            *out_pid = PID_WHEEL;
+            close(fd);
+            return 1;
+        }
 
-    int found = 0;
-
-    /* Nintendo: ep=0x81, maxpkt=64 */
-    po.ep_no=0x81;
-    if (ioctl(fd,USB_FS_OPEN,&po)==0 && po.max_packet_length==64) {
-        gp_log("probe: %s ep=0x81 mpkt=%u → Nintendo\n", path,(unsigned)po.max_packet_length);
-        struct usb_fs_close pc; memset(&pc,0,sizeof(pc)); pc.ep_index=0; ioctl(fd,USB_FS_CLOSE,&pc);
-        *out_vid=VID_SWITCH; *out_pid=PID_SWITCH;
-        found = 1;
-        goto done;
+        /* Qualquer outro dispositivo USB que nao seja o volante -> IGNORAR com seguranca */
+        close(fd);
+        return 0;
     }
 
-    /* Xbox One: ep=0x82, maxpkt in (0,64] */
-    memset(&po,0,sizeof(po)); po.ep_index=0; po.max_bufsize=64; po.max_frames=1;
-    po.ep_no=0x82;
-    if (ioctl(fd,USB_FS_OPEN,&po)==0 && po.max_packet_length>0 && po.max_packet_length<=64) {
-        gp_log("probe: %s ep=0x82 mpkt=%u → Xbox One\n", path,(unsigned)po.max_packet_length);
-        struct usb_fs_close pc; memset(&pc,0,sizeof(pc)); pc.ep_index=0; ioctl(fd,USB_FS_CLOSE,&pc);
-        *out_vid=VID_XBOX; *out_pid=PID_XBOX;
-        found = 1;
-        goto done;
-    }
-
-done:
-    memset(&u,0,sizeof(u)); ioctl(fd,USB_FS_UNINIT,&u);
     close(fd);
-    return found;
+    return 0;
 }
 
 /* ── Create VDA and force_bind for a slot ─────────────────────────────── */
@@ -308,14 +305,7 @@ static int32_t create_vda_for_slot(int slot) {
     } else if (handle >= 0) {
         gp_log("slot[%d] klog timeout — using direct handle %d\n", slot, handle);
     } else {
-        gp_log("slot[%d] GetHandle scan...\n", slot);
-        static const int32_t uids[]={1,0x10000000,(int32_t)0xffffffff};
-        for(int ui=0;ui<3&&handle<0;ui++)
-            for(int idx=0;idx<8&&handle<0;idx++){
-                handle=scePadGetHandle(uids[ui],3,idx);
-                if(handle>=0) gp_log("slot[%d] GetHandle uid=0x%08x idx=%d h=%d\n",
-                                     slot,(uint32_t)uids[ui],idx,handle);
-            }
+        gp_log("slot[%d] Cannot identify the new virtual device — refusing unrelated handles\n", slot);
     }
     if (handle>=0)
         gp_log("slot[%d] VDI handle=0x%x ready\n", slot, (uint32_t)handle);
@@ -357,6 +347,63 @@ static void *usb_hid_thread(void *arg) {
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
            slot, dev_path, vid, pid);
 
+    /* ── Thrustmaster Ferrari 458 Spider ──────────────────────────────── */
+    if (pid == PID_WHEEL) {
+        wheel_diagnostics_event(WHEEL_DETECTED, 0);
+        fd = open(dev_path, O_RDWR);
+        if (fd < 0) { wheel_diagnostics_event(WHEEL_ERROR, errno); gp_log("slot[%d] Wheel open fail errno=%d\n", slot, errno); goto exit_slot; }
+
+        /* Recheck after opening: a hotplug can change a probed ugen path. */
+        struct usb_device_descriptor wheel_desc;
+        if (ioctl(fd, USB_GET_DEVICE_DESC, &wheel_desc) != 0 ||
+            UGETW(wheel_desc.idVendor) != VID_WHEEL || UGETW(wheel_desc.idProduct) != PID_WHEEL) {
+            wheel_diagnostics_event(WHEEL_ERROR, errno ? errno : EIO);
+            gp_log("slot[%d] Wheel identity changed — leaving USB drivers attached\n", slot);
+            close(fd);
+            goto exit_slot;
+        }
+
+        wheel_diagnostics_event(WHEEL_USB_OPEN, 0);
+        { int ii; for(ii=0;ii<4;ii++){int i2=ii; ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2);} }
+        usleep(120000);
+        memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
+        init.pEndpoints=eps; init.ep_index_max=2;
+        if (ioctl(fd,USB_FS_INIT,&init)!=0){
+            wheel_diagnostics_event(WHEEL_ERROR, errno ? errno : EIO);
+            gp_log("slot[%d] Wheel FS_INIT fail errno=%d\n",slot,errno);
+            close(fd); goto exit_slot;
+        }
+
+        memset(&fs_open,0,sizeof(fs_open));
+        fs_open.ep_index=0; fs_open.ep_no=WHEEL_EP_IN;
+        fs_open.max_bufsize=64; fs_open.max_frames=1;
+        if (ioctl(fd,USB_FS_OPEN,&fs_open)!=0){
+            wheel_diagnostics_event(WHEEL_ERROR, errno ? errno : EIO);
+            gp_log("slot[%d] Wheel IN fail errno=%d\n",slot,errno);
+            goto uninit_exit;
+        }
+        gp_log("slot[%d] Wheel IN ep=0x%02x ok maxpkt=%u\n",
+               slot, WHEEL_EP_IN, (unsigned)fs_open.max_packet_length);
+
+        buffers[0]=buf; lengths[0]=64;
+        eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
+        eps[0].timeout=50; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
+
+        memset(&fs_open,0,sizeof(fs_open));
+        fs_open.ep_index=1; fs_open.ep_no=WHEEL_EP_OUT;
+        fs_open.max_bufsize=64; fs_open.max_frames=1;
+        out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
+        gp_log("slot[%d] Wheel OUT ep=0x%02x opened=%d\n", slot, WHEEL_EP_OUT, out_opened);
+
+        int handshake_result = out_opened ? wheel_gip_handshake(fd, eps) : -errno;
+        if (!out_opened || handshake_result != 0) {
+            wheel_diagnostics_event(WHEEL_ERROR, handshake_result < 0 ? -handshake_result : EIO);
+            gp_log("slot[%d] Wheel handshake failed — retrying detection\n", slot);
+            goto reinit;
+        }
+        goto main_loop;
+    }
+
     /* ── Xbox One: single-pass ─────────────────────────────────────────── */
     if (pid == PID_XBOX) {
         fd = open(dev_path, O_RDWR);
@@ -365,7 +412,7 @@ static void *usb_hid_thread(void *arg) {
         { int ii; for(ii=0;ii<4;ii++){int i2=ii; ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2);} }
         usleep(120000); /* hub settle: give USB hub time to propagate detach */
         memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
-        init.pEndpoints=eps; init.ep_index_max=4;
+        init.pEndpoints=eps; init.ep_index_max=2;
         if (ioctl(fd,USB_FS_INIT,&init)!=0){
             gp_log("slot[%d] Xbox FS_INIT fail errno=%d\n",slot,errno);
             close(fd); goto exit_slot;
@@ -391,7 +438,7 @@ static void *usb_hid_thread(void *arg) {
         out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
         gp_log("slot[%d] Xbox OUT ep=0x%02x opened=%d\n", slot, XBOX_EP_OUT, out_opened);
 
-        xbox_gip_handshake(fd, eps);
+        if (!out_opened || xbox_gip_handshake(fd, eps) != 0) goto reinit;
         goto main_loop;
     }
 
@@ -475,9 +522,11 @@ main_loop: ;
 
         memset(&start,0,sizeof(start)); start.ep_index=0;
         if (ioctl(fd,USB_FS_START,&start)!=0) {
+            if (pid == PID_WHEEL) wheel_diagnostics_event(WHEEL_ERROR, errno);
             if (errno==EBUSY){
                 memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-                usleep(5000);
+                gp_log("slot[%d] USB endpoint busy — reinitializing\n", slot);
+                goto reinit;
             } else if (errno==ENXIO||errno==ENOTTY){
                 gp_log("slot[%d] START errno=%d — device gone\n",slot,errno); goto reinit;
             } else {
@@ -487,60 +536,77 @@ main_loop: ;
         }
 
         int ok=0, cerr=0, cw=0;
-        for(cw=0;cw<60;cw++){
+        for(cw=0;cw<(eps[0].timeout+50)*2;cw++){
             memset(&complete,0,sizeof(complete)); complete.ep_index=0;
-            if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
+            if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){
+                if (complete.ep_index != 0) continue;
+                ok=1;break;
+            }
             cerr=errno;
-            if(cerr==ENXIO||cerr==ENOTTY){gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
-            if(cerr!=EBUSY) break;
+            if(cerr==ENXIO||cerr==ENOTTY){if (pid == PID_WHEEL) wheel_diagnostics_event(WHEEL_ERROR, cerr);gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
+            if(cerr!=EBUSY && cerr!=EINTR) break;
             usleep(500);
         }
         if(!ok){
+            if (pid == PID_WHEEL) wheel_diagnostics_event(WHEEL_ERROR, cerr ? cerr : ETIMEDOUT);
             memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-            continue;
+            gp_log("slot[%d] USB completion wait failed errno=%d\n",slot,cerr);
+            goto reinit;
         }
-        if(lengths[0]<1) continue;
+        if (eps[0].status == USB_ERR_TIMEOUT) continue;
+        if (eps[0].status != USB_ERR_NORMAL_COMPLETION) {
+            if (pid == PID_WHEEL) wheel_diagnostics_event(WHEEL_ERROR, eps[0].status);
+            gp_log("slot[%d] USB input status=%d — reinitializing\n", slot, eps[0].status);
+            goto reinit;
+        }
+        if(eps[0].aFrames != 1 || lengths[0]<1 || lengths[0]>sizeof(buf)) continue;
 
         uint32_t len = lengths[0];
 
         ScePadData pad; memset(&pad,0,sizeof(pad)); pad.quat.w=1.0f;
         int injected = 0;
 
-        if (pid == PID_XBOX) {
+        if (pid == PID_WHEEL) {
+            injected = wheel_handle_packet(fd, eps, buf, len, &pad);
+        } else if (pid == PID_XBOX) {
             injected = xbox_handle_packet(fd, eps, buf, len, &pad);
         } else {
             injected = nintendo_handle_packet(fd, eps, buf, len, &hs_state, &nintendo_seq, &pad);
         }
 
+        if (injected < 0) {
+            if (pid == PID_WHEEL) wheel_diagnostics_event(WHEEL_ERROR, -injected);
+            goto reinit;
+        }
         if (injected > 0) {
             if (!usb_ready_notified) {
-                notify("Ghostcontrol: slot[%d] streaming — controller active", slot);
+                notify("Ghostcontrol: slot[%d] streaming — volante ativo", slot);
                 usb_ready_notified = 1;
             }
-            /* First real button press confirms the assignment — release the gate
+            /* First real button press or steering confirms the assignment — release the gate
              * so the manager can start the next controller's dialog. */
-            if (!g_slots[slot].confirmed && pad.buttons != 0) {
+            if (!g_slots[slot].confirmed && (pad.buttons != 0 || pad.analogButtons.r2 > 30 || pad.analogButtons.l2 > 30 || pad.leftStick.x != 128)) {
                 g_slots[slot].confirmed = 1;
                 if (g_assign_slot == slot) g_assign_slot = -1;
-                gp_log("slot[%d] assignment confirmed (button press)\n", slot);
+                gp_log("slot[%d] assignment confirmed (activity)\n", slot);
             }
             inject_pad(slot, &pad);
         }
     }
 
 reinit:
-    if (usb_ready_notified) { notify("Ghostcontrol: slot[%d] controller disconnected", slot); usb_ready_notified=0; }
+    if (usb_ready_notified) notify("Ghostcontrol: slot[%d] controller disconnected", slot);
     memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
     if (out_opened) {
         memset(&fs_close,0,sizeof(fs_close)); fs_close.ep_index=1; ioctl(fd,USB_FS_CLOSE,&fs_close);
-        out_opened=0;
     }
     memset(&fs_close,0,sizeof(fs_close)); fs_close.ep_index=0; ioctl(fd,USB_FS_CLOSE,&fs_close);
 uninit_exit:
     memset(&uninit,0,sizeof(uninit)); ioctl(fd,USB_FS_UNINIT,&uninit);
-    close(fd); fd=-1;
+    close(fd);
 
 exit_slot:
+    if (pid == PID_WHEEL) { wheel_reset_state(); wheel_diagnostics_event(WHEEL_DISCONNECTED, 0); }
     gp_log("slot[%d] USB thread exiting — freeing slot\n", slot);
     scePadVirtualDeviceDeleteDevice(g_slots[slot].handle);
     pthread_mutex_lock(&g_slot_lock);
@@ -548,6 +614,8 @@ exit_slot:
     g_slots[slot].vdi_ready = 0;
     g_slots[slot].usb_active= 0;
     g_slots[slot].dev_path[0] = '\0';
+    g_slots[slot].confirmed = 0;
+    if (g_assign_slot == slot) g_assign_slot = -1;
     pthread_mutex_unlock(&g_slot_lock);
     return NULL;
 }
@@ -562,8 +630,8 @@ static void *controller_manager_thread(void *arg) {
         for (int i = 0; i < N_UGEN_PATHS; i++) {
             const char *path = UGEN_PATHS[i];
 
-            /* Skip non-external-bus paths */
-            if (strncmp(path, "/dev/ugen2.", 11) != 0) continue;
+            /* Skip non-ugen paths */
+            if (strncmp(path, "/dev/ugen", 9) != 0) continue;
 
             /* Serialize assignment: if a controller is still awaiting the user's
              * button press to confirm its dialog, do not start another one. */
@@ -598,6 +666,7 @@ static void *controller_manager_thread(void *arg) {
             }
 
             const char *name =
+                (vid==VID_WHEEL  && pid==PID_WHEEL)  ? "Thrustmaster Ferrari 458 Spider" :
                 (vid==VID_SWITCH && pid==PID_SWITCH) ? "Nintendo Switch Pro / 8BitDo" :
                 (vid==VID_NATIVE && pid==PID_NATIVE) ? "8BitDo Native" :
                 (vid==VID_XBOX   && pid==PID_XBOX)   ? "Xbox One S" : "Unknown";
@@ -649,6 +718,7 @@ static void *controller_manager_thread(void *arg) {
             }
             targ->slot = slot;
             strncpy(targ->dev_path, path, sizeof(targ->dev_path)-1);
+            targ->dev_path[sizeof(targ->dev_path)-1] = '\0';
             targ->vid=vid; targ->pid=pid;
 
             pthread_t tid;
@@ -711,18 +781,33 @@ static void elevate_credentials(void) {
 int main(void) {
     int32_t userId=-1, fgUser=-1; int ret;
 
+    /* Keep the descriptor open: the OS releases ownership when this process exits. */
+    if (mkdir(LOG_DIR, 0755) != 0 && errno != EEXIST) return 1;
+    int instance_fd = instance_claim(INSTANCE_PATH, 1);
+    if (instance_fd < 0) {
+        notify("Ghostcontrol: cannot reserve driver instance (error %d)", errno);
+        return 1;
+    }
+    wheel_config_load();
+    wheel_reset_state();
+    /* A legacy payload without the lock may still own 8088. Do not start a
+     * second USB reader or terminate an unverified PID in that case. */
+    if (web_server_start(8088) != 0) {
+        notify("Ghostcontrol: port 8088 unavailable; stop the previous driver (error %d)", errno);
+        close(instance_fd);
+        return 1;
+    }
     ghostpad_status_log_reset();
     gp_log("Ghost-Control v5 starting — %d slots\n", MAX_SLOTS);
     notify("Ghostcontrol by StonedModder — plug in controllers now");
 
-    /* Kill previous instance */
-    { int pfd=open(PID_PATH,O_RDONLY);
-      if(pfd>=0){char pb[16]={0};read(pfd,pb,15);close(pfd);
-        pid_t old=(pid_t)atoi(pb);
-        if(old>0&&old!=getpid()){gp_log("Killing prev pid=%d\n",old);kill(old,SIGTERM);usleep(600000);}
+    /* PID_PATH stays informational for existing tools. Never signal its value. */
+    { int pfd = open(PID_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      if (pfd >= 0) {
+          char text[32]; int n = snprintf(text, sizeof(text), "%d", (int)getpid());
+          if (write(pfd, text, (size_t)n) != n) gp_log("PID file write failed\n");
+          close(pfd);
       }
-      int pfd2=open(PID_PATH,O_WRONLY|O_CREAT|O_TRUNC,0600);
-      if(pfd2>=0){char pb[16];snprintf(pb,sizeof(pb),"%d",getpid());write(pfd2,pb,strlen(pb));close(pfd2);}
     }
 
     /* Init slots */
@@ -739,8 +824,8 @@ int main(void) {
     sceUserServiceGetInitialUser(&userId);
     sceUserServiceGetForegroundUser(&fgUser);
     gp_log("userId=0x%08x fgUser=0x%08x\n", (uint32_t)userId, (uint32_t)fgUser);
-    g_inject_uid = (fgUser > 0) ? fgUser : userId;
     if ((uint32_t)userId<0x10000000u||(uint32_t)userId>0x1000000Fu) userId=0x10000000;
+    g_inject_uid = (fgUser > 0) ? fgUser : userId;
     gp_log("inject_uid=0x%08x\n", (uint32_t)g_inject_uid);
 
     elevate_credentials();
@@ -748,10 +833,8 @@ int main(void) {
     ret=scePadInit(); gp_log("scePadInit: 0x%08x\n", ret);
     ret=scePadSetProcessPrivilege(1); gp_log("scePadSetProcessPrivilege: 0x%08x\n", ret);
 
-    /* Clean up any orphaned VDA devices */
-    for (int dh=0; dh<64; dh++) {
-        if (scePadVirtualDeviceDeleteDevice(dh)==0) gp_log("deleteDevice(%d)\n", dh);
-    }
+    /* Each slot deletes only its own virtual device when its USB reader exits.
+     * Do not delete arbitrary handles belonging to other payloads/controllers. */
 
     /* Start klog capture thread first — must be running before any VDA call */
     pthread_t klog_tid;
@@ -767,6 +850,8 @@ int main(void) {
         pthread_detach(mgr_tid);
         gp_log("Manager thread started\n");
     }
+
+    gp_log("Web server configurator active on port 8088\n");
 
     /* Keep-alive */
     uint32_t tick = 0;

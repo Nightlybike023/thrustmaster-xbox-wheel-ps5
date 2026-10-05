@@ -84,6 +84,7 @@ extern int kernel_set_vmem_protection(pid_t pid, intptr_t addr, size_t size, int
 #define GHOSTPAD_VDA_PS4_CAVE_OFF              0x0dd2u
 #define GHOSTPAD_VDA_PS4_CAVE_LEN              14u
 
+#if defined(__ORBIS__) && GHOSTPAD_ENABLE_KNOWN_VDA_PATCH
 static uint64_t
 ghostpad_fnv1a64(const uint8_t *buf, size_t len)
 {
@@ -105,6 +106,8 @@ ghostpad_all_byte(const uint8_t *buf, size_t len, uint8_t value)
     }
     return 1;
 }
+
+#endif
 
 /* PT_IO fallback for shellui_pad_update — always enabled */
 
@@ -990,8 +993,6 @@ void shellui_stub_force_vda(void *arg)
 {
     ShellUiPadArgs *a = (ShellUiPadArgs *)arg;
     int32_t assignment_hint = 0;
-    int32_t fallback_handle = a->rc_log[0];
-    int32_t fallback_use_insert = a->rc_log[1];
     int32_t pad_type = (a->virtual_device_type >= 0) ? a->virtual_device_type : 3;
     int32_t vda_handle = -1;
     int32_t handle_from_vda_token = 0;
@@ -999,9 +1000,6 @@ void shellui_stub_force_vda(void *arg)
     int32_t button_probe_done = 0;
     int32_t uid_try[3];
     int32_t ui;
-
-    if (fallback_handle < 0) fallback_handle = -1;
-    if (fallback_use_insert < 0) fallback_use_insert = 0;
 
     a->rc_log[15] = (int32_t)0x53545542u; /* "STUB" */
 
@@ -3046,10 +3044,17 @@ shellui_pad_retry_vda_shellcore(int32_t userId)
     vdp.f[0] = 32;
     vdp.f[1] = userId;
     /* Write vdp struct onto the stack of the stopped process via PT_IO */
-    struct reg regs;
-    sys_ptrace(PT_GETREGS, target, (caddr_t)&regs, 0);
+    struct reg regs = {0};
+    if (sys_ptrace(PT_GETREGS, target, (caddr_t)&regs, 0) != 0 || !regs.r_rsp) {
+        klog_printf("[Ghostpad] retry_vda: cannot read process registers\n");
+        sys_ptrace(PT_DETACH, target, (caddr_t)1, 0);
+        return -1;
+    }
     intptr_t vdp_addr = (regs.r_rsp - 128 - (intptr_t)sizeof(vdp)) & ~(intptr_t)0xf;
-    pt_io_write(target, vdp_addr, &vdp, sizeof(vdp));
+    if (pt_io_write(target, vdp_addr, &vdp, sizeof(vdp)) != 0) {
+        sys_ptrace(PT_DETACH, target, (caddr_t)1, 0);
+        return -1;
+    }
 
     /* pt_call VDA(vdp_addr, 3) via fn_vda */
     int64_t vda_ret = pt_call(target, fn_vda, trap_mem,
@@ -3929,4 +3934,3 @@ shellui_pad_unpatch(void)
     }
     return 0;
 }
-

@@ -97,8 +97,8 @@ int nintendo_send_subcmd(int fd, struct usb_fs_endpoint *eps,
                          const uint8_t *data, uint32_t data_len) {
     static const uint8_t rumble[8] = {0x00,0x01,0x40,0x40,0x00,0x01,0x40,0x40};
     uint8_t buf[64];
+    if (!seq || data_len > sizeof(buf) - 11 || (data_len && !data)) return -1;
     uint32_t len = 11 + data_len;
-    if (len > sizeof(buf)) return -1;
     memset(buf, 0, sizeof(buf));
     buf[0] = 0x01; buf[1] = *seq & 0x0f;
     memcpy(buf+2, rumble, 8);
@@ -113,6 +113,7 @@ int nintendo_handle_packet(int fd, struct usb_fs_endpoint *eps,
                            const uint8_t *buf, uint32_t len,
                            int *hs_state, uint8_t *seq,
                            ScePadData *out_pad) {
+    if (!buf || !out_pad || !hs_state || !seq || len < 1 || len > 64) return 0;
     uint8_t rid = buf[0];
 
     /* Data packets */
@@ -126,7 +127,7 @@ int nintendo_handle_packet(int fd, struct usb_fs_endpoint *eps,
         nintendo_parse_0x3f(buf, out_pad);
         return 1;
     }
-    if (rid == 0x21 && len >= 12) {
+    if (rid == 0x21 && len >= 13) {
         LOG("0x21 ACK subcmd=0x%02x hs=%d\n", (buf[12]&0x7f), *hs_state);
         if (*hs_state == HS_STREAMING) {
             nintendo_parse_0x30(buf, out_pad);
@@ -134,25 +135,25 @@ int nintendo_handle_packet(int fd, struct usb_fs_endpoint *eps,
         }
         return 0;
     }
-    if (rid == 0x81) {
+    if (rid == 0x81 && len >= 2) {
         if (*hs_state == HS_STREAMING) {
             LOG("0x81 sub=0x%02x while streaming — reconnect\n", buf[1]);
             *hs_state = HS_WAIT_81_01;
             return 0;
         }
         if (buf[1] == 0x01 && *hs_state == HS_WAIT_81_01) {
-            usb_send_cmd(fd, &eps[1], 0x80, 0x02);
+            if (usb_send_cmd(fd, &eps[1], 0x80, 0x02) != 0) return -1;
             LOG("0x81 0x01 → [80 02]\n");
             *hs_state = HS_WAIT_81_02;
         } else if (buf[1] == 0x02 && *hs_state <= HS_WAIT_81_02) {
-            usb_send_cmd(fd, &eps[1], 0x80, 0x04);
+            if (usb_send_cmd(fd, &eps[1], 0x80, 0x04) != 0) return -1;
             LOG("0x81 0x02 → [80 04] + subcmds\n");
             uint8_t d[]={0x01};
-            nintendo_send_subcmd(fd,eps,seq,0x40,d,1);
-            nintendo_send_subcmd(fd,eps,seq,0x48,d,1);
-            nintendo_send_subcmd(fd,eps,seq,0x30,d,1);
+            if (nintendo_send_subcmd(fd,eps,seq,0x40,d,1) != 0 ||
+                nintendo_send_subcmd(fd,eps,seq,0x48,d,1) != 0 ||
+                nintendo_send_subcmd(fd,eps,seq,0x30,d,1) != 0) return -1;
             uint8_t d2[]={0x30};
-            nintendo_send_subcmd(fd,eps,seq,0x03,d2,1);
+            if (nintendo_send_subcmd(fd,eps,seq,0x03,d2,1) != 0) return -1;
             *hs_state = HS_STREAMING;
         }
         return 0;

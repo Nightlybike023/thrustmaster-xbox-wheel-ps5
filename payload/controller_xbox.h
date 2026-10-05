@@ -43,7 +43,7 @@ void xbox_parse_input(const uint8_t *buf, ScePadData *o);
 /* GIP handshake: catch ANNOUNCE → ACK → POWER.
  * Call immediately after opening IN+OUT endpoints.
  * eps[0]=IN eps[1]=OUT. */
-void xbox_gip_handshake(int fd, struct usb_fs_endpoint *eps);
+int xbox_gip_handshake(int fd, struct usb_fs_endpoint *eps);
 
 /* Handle one IN packet. Returns 1 if pad updated, 0 to skip, -1 to reinit. */
 int  xbox_handle_packet(int fd, struct usb_fs_endpoint *eps,
