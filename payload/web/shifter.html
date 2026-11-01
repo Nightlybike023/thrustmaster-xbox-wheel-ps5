@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Câmbio PS Move</title>
+<style>
+:root { --bg:#111418; --card:#1b2027; --line:#2c333d; --text:#e8ecf1; --dim:#8a94a3; --up:#3fb27f; --down:#e0703a; --warn:#e2b53a; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:15px/1.4 system-ui, sans-serif; }
+main { max-width:720px; margin:0 auto; padding:16px; display:grid; gap:12px; }
+h1 { font-size:18px; margin:0; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+.status { color:var(--dim); font-size:13px; }
+.status.ok { color:var(--up); }
+.status.bad { color:var(--down); }
+.gauge { position:relative; height:56px; background:#0c0f12; border-radius:8px; overflow:hidden; }
+.zone { position:absolute; top:0; bottom:0; }
+.zone.up { background:rgba(63,178,127,.18); }
+.zone.down { background:rgba(224,112,58,.18); }
+.mark { position:absolute; top:0; bottom:0; width:1px; background:var(--line); }
+.needle { position:absolute; top:4px; bottom:4px; width:6px; margin-left:-3px; border-radius:3px; background:var(--text); transition:left .05s linear; }
+.scale { display:flex; justify-content:space-between; color:var(--dim); font-size:12px; margin-top:4px; }
+.big { display:flex; gap:12px; align-items:baseline; margin-top:10px; flex-wrap:wrap; }
+.big b { font-size:34px; font-variant-numeric:tabular-nums; }
+.pill { padding:3px 10px; border-radius:99px; background:#0c0f12; color:var(--dim); font-size:13px; }
+.pill.up { background:var(--up); color:#06130d; }
+.pill.down { background:var(--down); color:#1d0c03; }
+.counts { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.count { text-align:center; }
+.count b { display:block; font-size:40px; font-variant-numeric:tabular-nums; }
+.count.up b { color:var(--up); } .count.down b { color:var(--down); }
+table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+td, th { padding:5px 4px; border-bottom:1px solid var(--line); text-align:left; font-size:13px; }
+th { color:var(--dim); font-weight:500; }
+.row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+button { background:#2a3240; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:9px 12px; font:inherit; }
+.opts { display:grid; gap:8px; margin-top:8px; }
+[hidden] { display:none !important; }
+.opts label { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }
+select { background:#0c0f12; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:7px; font:inherit; max-width:100%; }
+input { width:64px; background:#0c0f12; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:7px; font:inherit; }
+.btns span { display:inline-block; min-width:44px; text-align:center; padding:4px 6px; margin:2px; border-radius:6px; background:#0c0f12; color:var(--dim); font-size:13px; }
+.btns span.on { background:var(--warn); color:#1a1405; }
+.bar { height:8px; background:#0c0f12; border-radius:4px; overflow:hidden; margin-top:6px; }
+.bar i { display:block; height:100%; background:var(--warn); width:0; }
+.help { color:var(--dim); font-size:13px; margin:0; padding-left:18px; }
+.msg { color:var(--dim); font-size:13px; min-height:1em; }
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <p class="status"><a href="/" style="color:inherit">← Ajustes do volante</a></p>
+    <h1>Câmbio PS Move</h1>
+    <div class="status" id="status">Carregando…</div>
+  </div>
+
+  <section class="card">
+    <strong>Enviar ao jogo</strong>
+    <div class="opts">
+      <label>Usar o PS Move como
+        <select id="use">
+          <option value="off">Desligado (só mede)</option>
+          <option value="shift">Câmbio</option>
+          <option value="lever">Freio de mão</option>
+        </select>
+      </label>
+      <label class="for-shift"><span><input id="fast" type="checkbox" style="width:auto"> Modo rápido (troca no meio do movimento)</span></label>
+      <label class="for-shift">Subir marcha <select id="up" data-none="Borboleta direita do volante"></select></label>
+      <label class="for-shift">Descer marcha <select id="down" data-none="Borboleta esquerda do volante"></select></label>
+      <label><span id="hbLabel">Freio de mão (gatilho T)</span> <select id="handbrake" data-none="Desativado"></select></label>
+      <label class="for-lever">Segurar junto com o puxão
+        <select id="leverHold">
+          <option value="0">Nada (só puxar)</option><option value="1">Gatilho T</option>
+          <option value="2">Cruz (X)</option><option value="3">Círculo</option><option value="4">Quadrado</option>
+        </select>
+      </label>
+      <label class="for-lever">Puxar para trás a partir de <span><input id="leverDeg" type="number" step="0.5" min="3" max="40">°</span></label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="saveOpts">Salvar no PS5</button>
+      <button id="testUp" class="for-shift">Testar subir</button><button id="testDown" class="for-shift">Testar descer</button>
+    </div>
+    <p class="status" id="optsInfo"></p>
+    <p class="status" id="optsHelp"></p>
+  </section>
+
+  <section class="card">
+    <div class="gauge" id="gauge">
+      <div class="zone down" id="zoneDown"></div>
+      <div class="zone up" id="zoneUp"></div>
+      <div class="mark" id="levelMark" style="background:var(--warn);width:2px"></div>
+      <div class="mark" style="left:50%"></div>
+      <div class="needle" id="needle" style="left:50%"></div>
+    </div>
+    <div class="scale"><span>−30° puxar</span><span>0°</span><span>empurrar +30°</span></div>
+    <div class="big">
+      <b id="tilt">0,0°</b>
+      <span class="pill" id="state">centro</span>
+      <span class="status" id="extra"></span>
+    </div>
+  </section>
+
+  <section class="card counts">
+    <div class="count up"><span>Subiu marcha</span><b id="ups">0</b></div>
+    <div class="count down"><span>Desceu marcha</span><b id="downs">0</b></div>
+  </section>
+
+  <section class="card">
+    <strong>Posições paradas</strong>
+    <p class="status">Cada ângulo onde o tubo ficou parado por 0,3 s. Os níveis do suporte aparecem aqui.</p>
+    <table><thead><tr><th>Ângulo</th><th>Vezes</th></tr></thead><tbody id="rests"></tbody></table>
+  </section>
+
+  <section class="card">
+    <strong>Últimas trocas</strong>
+    <table><thead><tr><th>Troca</th><th>Pico</th><th>Giro</th><th>Tempo</th><th>Há</th></tr></thead><tbody id="events"></tbody></table>
+  </section>
+
+  <section class="card">
+    <strong>Botões (freio de mão)</strong>
+    <div class="btns" id="btns"></div>
+    <div class="status">Gatilho T: <span id="trig">0</span></div>
+    <div class="bar"><i id="trigBar"></i></div>
+  </section>
+
+  <section class="card">
+    <strong>Ajustes</strong>
+    <div class="row" style="margin-top:8px">
+      <label>Degrau mínimo <input id="on" type="number" step="0.5" min="2" max="45">°</label>
+      <input id="off" type="hidden">
+      <button id="saveTh">Aplicar</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="centre">Centralizar agora</button>
+      <button id="reset">Zerar contadores</button>
+      <button id="export">Exportar registro</button>
+    </div>
+    <div class="msg" id="msg"></div>
+    <ul class="help">
+      <li>A troca conta quando o tubo para num nível do suporte: um nível à frente sobe, um atrás desce. A linha amarela é o nível atual.</li>
+      <li>Deixe o tubo no meio e parado: o centro é marcado sozinho. Para refazer, segure o botão Move 1 s.</li>
+      <li>Se empurrar mostrar ângulo negativo ou quase zero, incline o tubo para frente e segure Triângulo 1 s.</li>
+      <li>Com "Trocar marcha com o PS Move" desligado, o câmbio só mede e nada chega ao jogo.</li>
+    </ul>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (v, d = 1) => Number(v).toLocaleString('pt-BR', { minimumFractionDigits: d, maximumFractionDigits: d });
+let last = null, editing = false, shown = null, optsEditing = false;
+const RANGE = 30;
+const pos = deg => 50 + Math.max(-RANGE, Math.min(RANGE, deg)) / RANGE * 50;
+
+function render(s) {
+  last = s;
+  const live = s.connected && s.age_ms < 1500;
+  $('status').textContent = live ? (s.centred ? 'PS Move conectado' : 'PS Move conectado · deixe o tubo parado no meio') : 'PS Move desconectado · ligue o Move (botão PS)';
+  $('status').className = 'status ' + (live ? 'ok' : 'bad');
+  /* Sensor noise is about ±0.5°: hold the needle until the change is real. */
+  if (shown === null || Math.abs(s.tilt - shown) >= 0.8) shown = s.tilt;
+  if (Math.abs(shown) < 2) shown = 0;
+  $('needle').style.left = pos(shown) + '%';
+  $('zoneUp').style.left = pos(s.level + s.on) + '%'; $('zoneUp').style.right = '0';
+  $('levelMark').style.left = pos(s.level) + '%';
+  $('zoneDown').style.left = '0'; $('zoneDown').style.width = pos(s.level - s.on) + '%';
+  $('tilt').textContent = (shown > 0 ? '+' : '') + fmt(shown) + '°';
+  const st = $('state');
+  st.textContent = s.state === 1 ? 'indo para frente' : s.state === 2 ? 'indo para trás' : 'parado no nível ' + (s.level > 0 ? '+' : '') + fmt(s.level) + '°';
+  st.className = 'pill' + (s.state === 1 ? ' up' : s.state === 2 ? ' down' : '');
+  $('extra').textContent = 'lado ' + fmt(s.side) + '° · giro ' + fmt(s.gyro, 0) + '°/s' + (s.forward_taught ? ' · frente ensinada' : '');
+  $('ups').textContent = s.ups; $('downs').textContent = s.downs;
+  $('rests').innerHTML = s.rests.slice().sort((a, b) => b.deg - a.deg)
+    .map(r => `<tr><td>${(r.deg > 0 ? '+' : '') + fmt(r.deg)}°</td><td>${r.hits}</td></tr>`).join('') || '<tr><td colspan="2" class="status">Nenhuma ainda</td></tr>';
+  $('events').innerHTML = s.events.slice(0, 12)
+    .map(e => `<tr><td>${e.kind === 'up' ? '▲ subiu' : '▼ desceu'}</td><td>${fmt(e.peak)}°</td><td>${fmt(e.gyro, 0)}°/s</td><td>${e.ms} ms</td><td>${fmt(e.ago_ms / 1000)} s</td></tr>`).join('') || '<tr><td colspan="5" class="status">Nenhuma ainda</td></tr>';
+  const names = [['move', 'Move'], ['t', 'T'], ['cross', '✕'], ['circle', '○'], ['square', '□'], ['triangle', '△']];
+  $('btns').innerHTML = names.map(([k, n]) => `<span class="${s[k] ? 'on' : ''}">${n}</span>`).join('');
+  $('trig').textContent = s.trigger; $('trigBar').style.width = (s.trigger / 255 * 100) + '%';
+  if (!editing) { $('on').value = s.on; $('off').value = s.off; }
+  if (!optsEditing) {
+    $('use').value = !s.enabled ? 'off' : s.lever ? 'lever' : 'shift';
+    $('fast').checked = !!s.fast;
+    $('leverDeg').value = s.lever_deg;
+    $('leverHold').value = String(s.lever_hold);
+    ['up', 'down', 'handbrake'].forEach(k => $(k).value = String(s[k]));
+    showUse();
+  }
+  const mode = !s.fast ? 'modo nível' : s.learned ? 'modo rápido ativo' : `modo rápido aprendendo: mude de nível ${3 - s.learn_count} vez(es) devagar`;
+  $('optsInfo').textContent = !s.enabled ? 'Desligado · só medindo, nada chega ao jogo.'
+    : s.lever ? (s.lever_pulled ? 'Freio de mão PUXADO' : 'Freio de mão solto') + (s.handbrake ? '' : ' · escolha o botão do freio')
+    : `Câmbio · ${s.sent} trocas enviadas ao jogo · ${mode}.`;
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/shifter', { cache: 'no-store' });
+    if (r.ok) render(await r.json());
+  } catch (e) { $('status').textContent = 'Sem resposta do PS5'; $('status').className = 'status bad'; }
+  setTimeout(poll, 100);
+}
+
+async function post(path, data) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(data) });
+  $('msg').textContent = r.ok ? 'Feito.' : 'Valor recusado.';
+  return r.ok;
+}
+
+['on', 'off'].forEach(id => { $(id).addEventListener('focus', () => editing = true); $(id).addEventListener('blur', () => editing = false); });
+$('saveTh').onclick = async () => { await post('/api/shifter/thresholds', { on: $('on').value, off: $('off').value }); editing = false; };
+$('centre').onclick = () => post('/api/shifter/centre', { centre: '1' });
+const PAD_BUTTONS = [[16384, 'Cruz (X)'], [8192, 'Círculo'], [32768, 'Quadrado'], [4096, 'Triângulo'], [1024, 'L1'], [2048, 'R1'],
+  [256, 'L2'], [512, 'R2'], [2, 'L3'], [4, 'R3'], [16, 'Cima'], [64, 'Baixo'], [128, 'Esquerda'], [32, 'Direita'], [8, 'Options'], [1048576, 'Touchpad']];
+['up', 'down', 'handbrake'].forEach(id => {
+  const sel = $(id);
+  sel.innerHTML = `<option value="0">${sel.dataset.none}</option>` + PAD_BUTTONS.map(([v, n]) => `<option value="${v}">${n}</option>`).join('');
+});
+function showUse() {
+  const use = $('use').value;
+  document.querySelectorAll('.for-shift').forEach(el => el.hidden = use !== 'shift');
+  document.querySelectorAll('.for-lever').forEach(el => el.hidden = use !== 'lever');
+  $('hbLabel').textContent = use === 'lever' ? 'Botão do freio de mão' : 'Freio de mão (gatilho T)';
+  $('optsHelp').textContent = use === 'lever'
+    ? 'Na posição normal o freio fica solto. Puxe o tubo para trás para segurar o botão; volte para a frente para soltar.'
+      + ($('leverHold').value !== '0' ? ' Só aciona com o botão escolhido apertado junto.' : '')
+    : use === 'shift' ? 'Escolha os mesmos botões que o jogo usa para trocar de marcha.' : '';
+}
+['use', 'fast', 'up', 'down', 'handbrake', 'leverDeg', 'leverHold'].forEach(id => $(id).addEventListener('change', () => { optsEditing = true; showUse(); }));
+$('testUp').onclick = () => post('/api/shifter/test', { kind: 'up' });
+$('testDown').onclick = () => post('/api/shifter/test', { kind: 'down' });
+$('saveOpts').onclick = async () => {
+  const use = $('use').value;
+  await post('/api/shifter/options', {
+    enabled: use === 'off' ? '0' : '1', lever: use === 'lever' ? '1' : '0', lever_deg: $('leverDeg').value, lever_hold: $('leverHold').value,
+    fast: $('fast').checked ? '1' : '0', handbrake: $('handbrake').value, up: $('up').value, down: $('down').value
+  });
+  optsEditing = false;
+};
+$('reset').onclick = () => post('/api/shifter/reset', { reset: '1' });
+$('export').onclick = () => {
+  if (!last) return;
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  const name = `cambio-move-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.json`;
+  const a = document.createElement('a');
+  const shifter = { ...last, events: last.events.map(e => ({ ...e, at: new Date(d - e.ago_ms).toLocaleTimeString('pt-BR', { hour12: false }) + '.' + String((d - e.ago_ms) % 1000).padStart(3, '0') })) };
+  a.href = URL.createObjectURL(new Blob([JSON.stringify({ exported: d.toISOString(), shifter }, null, 2)], { type: 'application/json' }));
+  a.download = name; a.click(); URL.revokeObjectURL(a.href);
+};
+poll();
+</script>
+</body>
+</html>

@@ -20,6 +20,13 @@ suavização, oito perfis persistentes, backup atômico e falhas de gravação.
 Também cobrem atividade do botão Guide após uma pausa, preservação de códigos
 de erro USB, nomes como GT7 na importação e recusa de uma segunda porta web.
 
+A instrumentação de botões é coberta por bordas de acionamento e soltura,
+resultado do envio (aceito, recusado ou não enviado), duração dos toques,
+lacunas e repetições na sequência GIP (inclusive a virada 255→1), pacotes
+curtos ou de outros tipos, esperas USB, buffer circular de eventos e zerar
+contadores. `test_http.py` também abre um servidor com o buffer cheio para
+validar o JSON de `/api/buttons` no pior caso.
+
 `test_instance.c` usa processos de teste no Linux para verificar exclusão de
 instâncias, substituição do dono atual da trava e recusa de caminhos inválidos.
 Um número de processo antigo gravado no arquivo não causa sinalização de outro
@@ -32,3 +39,10 @@ automaticamente. Python 3 é necessário para compilar quando as páginas mudam.
 Os cabeçalhos em `compat/` permitem testar a lógica no Linux. A compatibilidade
 com a ABI do USB do PS5 é verificada na compilação com o SDK real. Os testes
 locais não comprovam o funcionamento do volante no console e não acessam o PS5.
+
+`test_shifter.c` simula o PS Move num suporte com níveis: troca por nível,
+quique depois da troca, trancos sem rotação, modo rápido (aprendizado do eixo,
+disparo no meio do movimento, desaprender quando o Move gira no suporte), freio
+de mão com histerese e botão obrigatório, opções salvas e varredura do Bluetooth
+só com a opção ligada ou a página aberta. `test_wheel.c` cobre o botão extra
+junto ao relatório do volante e `test_http.py` a API `/api/shifter`.

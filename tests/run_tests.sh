@@ -12,8 +12,11 @@ cc -std=gnu11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
 "$test_dir/test-instance" "$test_dir"
 cc -std=gnu11 -Wall -Wextra -Werror -g -pthread -fsanitize=address,undefined \
    -Itests/compat -I"$payload_dir" "$config_define" \
-   tests/test_wheel.c "$payload_dir/controller_wheel.c" "$payload_dir/web_server.c" -o "$test_dir/test-wheel"
+   tests/test_wheel.c "$payload_dir/controller_wheel.c" "$payload_dir/web_server.c" "$payload_dir/shifter.c" -lm -o "$test_dir/test-wheel"
 "$test_dir/test-wheel"
+cc -std=gnu11 -Wall -Wextra -Werror -g -pthread -fsanitize=address,undefined \
+   -I"$payload_dir" tests/test_shifter.c "$payload_dir/shifter.c" -lm -o "$test_dir/test-shifter"
+"$test_dir/test-shifter" "$test_dir"
 cc -std=gnu11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
    -Itests/compat -I"$payload_dir" tests/test_usb_helpers.c "$payload_dir/usb_helpers.c" -o "$test_dir/test-usb"
 "$test_dir/test-usb"

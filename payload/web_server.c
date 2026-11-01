@@ -4,6 +4,7 @@
 
 #include "web_server.h"
 #include "controller_wheel.h"
+#include "shifter.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,6 +89,63 @@ static void profiles_json(json_buffer_t *b, const wheel_profile_t profiles[WHEEL
     }
     append_json(b, "]");
 }
+static void telemetry_json(json_buffer_t *b, const wheel_telemetry_t *t) {
+    append_json(b,
+        "{\"connected\":%u,\"fresh\":%u,\"age_ms\":%u,\"link_age_ms\":%u,\"raw_steer\":%u,\"raw_throttle\":%u,\"raw_brake\":%u,"
+        "\"steer\":%d,\"throttle\":%u,\"brake\":%u,\"gear\":%d,"
+        "\"paddle_l\":%u,\"paddle_r\":%u,\"btn_a\":%u,\"btn_b\":%u,"
+        "\"btn_x\":%u,\"btn_y\":%u,\"btn_up\":%u,\"btn_down\":%u,"
+        "\"btn_left\":%u,\"btn_right\":%u,\"btn_menu\":%u,\"btn_view\":%u,\"btn_xbox\":%u,"
+        "\"last_button\":",
+        t->connected,t->fresh,t->age_ms,t->link_age_ms,t->raw_steer,t->raw_throttle,t->raw_brake,
+        t->steer_deg,t->throttle_pct,t->brake_pct,(int)t->gear,t->paddle_l,t->paddle_r,
+        t->btn_a,t->btn_b,t->btn_x,t->btn_y,t->btn_up,t->btn_down,t->btn_left,t->btn_right,t->btn_menu,t->btn_view,t->btn_xbox);
+    if (t->last_button < 0) append_json(b, "null");
+    else append_json(b, "\"%s\"", wheel_button_name((unsigned)t->last_button));
+    append_json(b, ",\"last_outcome\":%u,\"last_button_age_ms\":%u,\"presses\":{", t->last_outcome, t->last_button_age_ms);
+    for (unsigned i = 0; i < WHEEL_BTN_COUNT; i++)
+        append_json(b, "%s\"%s\":%u", i ? "," : "", wheel_button_name(i), t->press_count[i]);
+    append_json(b, "}}");
+}
+static void button_mask_json(json_buffer_t *b, uint16_t mask) {
+    append_json(b, "[");
+    for (unsigned i = 0, n = 0; i < WHEEL_BTN_COUNT; i++)
+        if (mask & (1u << i)) append_json(b, "%s\"%s\"", n++ ? "," : "", wheel_button_name(i));
+    append_json(b, "]");
+}
+static void buttons_json(json_buffer_t *b, const wheel_button_report_t *r) {
+    append_json(b,
+        "{\"now_ms\":%u,\"sessions\":%u,\"event_total\":%u,\"usb_polls\":%llu,\"usb_timeouts\":%llu,"
+        "\"usb_discarded\":%llu,\"short_packets\":%llu,\"other_packets\":%llu,\"last_other_cmd\":%u,"
+        "\"last_other_len\":%u,\"seq_lost\":%llu,\"seq_repeated\":%llu,\"buttons\":{",
+        r->now_ms, r->sessions, r->event_total, (unsigned long long)r->usb_polls,
+        (unsigned long long)r->usb_timeouts, (unsigned long long)r->usb_discarded,
+        (unsigned long long)r->short_packets, (unsigned long long)r->other_packets,
+        r->last_other_cmd, r->last_other_len,
+        (unsigned long long)r->seq_lost, (unsigned long long)r->seq_repeated);
+    for (unsigned i = 0; i < WHEEL_BTN_COUNT; i++) {
+        const wheel_button_stats_t *s = &r->buttons[i];
+        append_json(b, "%s\"%s\":{\"presses\":%u,\"releases\":%u,\"sent_ok\":%u,\"send_failed\":%u,"
+            "\"not_sent\":%u,\"last_hold_ms\":%u,\"min_hold_ms\":%u}", i ? "," : "", wheel_button_name(i),
+            s->presses, s->releases, s->sent_ok, s->send_failed, s->not_sent, s->last_hold_ms, s->min_hold_ms);
+    }
+    append_json(b, "},\"events\":[");
+    for (uint32_t i = 0; i < r->event_count; i++) {
+        const wheel_button_event_t *e = &r->events[i];
+        append_json(b, "%s{\"id\":%u,\"t_ms\":%u,\"gap_ms\":%u,\"cmd\":%u,\"seq\":%u,\"seq_lost\":%u,"
+            "\"raw4\":%u,\"raw5\":%u,\"pressed\":", i ? "," : "", e->id, e->t_ms, e->gap_ms,
+            e->cmd, e->seq, e->seq_lost, e->raw4, e->raw5);
+        button_mask_json(b, e->pressed);
+        append_json(b, ",\"released\":");
+        button_mask_json(b, e->released);
+        append_json(b, ",\"held\":");
+        button_mask_json(b, e->held);
+        append_json(b, ",\"hold_ms\":%u,\"pad_buttons\":%u,\"r2\":%u,\"l2\":%u,\"stick_x\":%u,"
+            "\"outcome\":%u,\"inject_result\":%d,\"inject_us\":%u}", e->hold_ms, e->pad_buttons,
+            e->r2, e->l2, e->stick_x, e->outcome, e->inject_result, e->inject_us);
+    }
+    append_json(b, "]}");
+}
 static void respond_json(int fd, const json_buffer_t *b) {
     if (b->failed) respond(fd, "500 Internal Server Error", "application/json", "{\"error\":\"Resposta muito longa\"}");
     else respond(fd, "200 OK", "application/json; charset=utf-8", b->data);
@@ -131,6 +189,115 @@ static int parse_form(char *body, form_pair_t pairs[FORM_MAX]) {
 static const char *form_value(const form_pair_t *pairs, int n, const char *key) {
     for (int i = 0; i < n; i++) if (!strcmp(pairs[i].key, key)) return pairs[i].value;
     return NULL;
+}
+static int parse_degrees(const char *v, float *out) {
+    char *end;
+    if (!v || !*v) return -1;
+    errno = 0;
+    double d = strtod(v, &end);
+    if (errno || *end || !(d > -1000.0 && d < 1000.0)) return -1;   /* also refuses nan/inf */
+    *out = (float)d;
+    return 0;
+}
+/* GET /api/shifter, POST /api/shifter/reset (reset=1), /api/shifter/centre (centre=1),
+ * /api/shifter/thresholds (on, off), /api/shifter/options (enabled, handbrake, up, down). */
+static void shifter_route(int cfd, const char *target, int is_post, char *body) {
+    if (!strcmp(target, "/api/shifter")) {
+        if (is_post) goto method_bad;
+        static shifter_status st;   /* served by the single web thread */
+        uint64_t now = shifter_now_us();
+        shifter_note_viewer(now);
+        shifter_get(&st, now);
+        char data[8192];
+        json_buffer_t b = { data, sizeof(data), 0, 0 };
+        append_json(&b,
+            "{\"connected\":%d,\"age_ms\":%u,\"level\":%.1f,\"tilt\":%.1f,\"side\":%.1f,\"gyro\":%.0f,\"on\":%.1f,\"off\":%.1f,"
+            "\"state\":%d,\"centred\":%d,\"forward_taught\":%d,\"ups\":%u,\"downs\":%u,"
+            "\"trigger\":%u,\"t\":%u,\"move\":%u,\"cross\":%u,\"circle\":%u,\"square\":%u,\"triangle\":%u,"
+            "\"enabled\":%d,\"handbrake\":%u,\"up\":%u,\"down\":%u,\"sent\":%u,\"fast\":%d,\"learned\":%d,\"learn_count\":%d,\"lever\":%d,\"lever_deg\":%.1f,\"lever_pulled\":%d,\"lever_hold\":%d,\"event_total\":%u,\"events\":[",
+            st.connected, st.age_ms, st.level_deg, st.tilt_deg, st.side_deg, st.gyro_dps, st.on_deg, st.off_deg,
+            st.state, st.centred, st.forward_taught, st.ups, st.downs,
+            st.trigger, st.t_button, st.move_button, st.cross, st.circle, st.square, st.triangle, st.enabled, st.handbrake, st.up_button, st.down_button, st.sent, st.fast, st.learned, st.learn_count, st.lever, st.lever_deg, st.lever_pulled, st.lever_hold, st.event_count);
+        uint32_t kept = st.event_count < SHIFTER_EVENT_COUNT ? st.event_count : SHIFTER_EVENT_COUNT;
+        for (uint32_t i = 0; i < kept; i++) {   /* newest first */
+            const shifter_event *e = &st.events[(st.event_count - 1 - i) % SHIFTER_EVENT_COUNT];
+            uint32_t ago = now >= e->at_us ? (uint32_t)((now - e->at_us) / 1000u) : 0;
+            append_json(&b, "%s{\"kind\":\"%s\",\"peak\":%.1f,\"gyro\":%.0f,\"ms\":%u,\"ago_ms\":%u}", i ? "," : "",
+                        e->kind == SHIFT_UP ? "up" : "down", e->peak_deg, e->peak_gyro, e->duration_ms, ago);
+        }
+        append_json(&b, "],\"rests\":[");
+        for (uint32_t i = 0; i < st.rest_count; i++)
+            append_json(&b, "%s{\"deg\":%.1f,\"hits\":%u}", i ? "," : "", st.rests[i].deg, st.rests[i].hits);
+        append_json(&b, "]}");
+        respond_json(cfd, &b);
+        return;
+    }
+    if (!is_post) goto method_bad;
+    form_pair_t pairs[FORM_MAX];
+    int n = parse_form(body, pairs);
+    if (n < 0) goto bad;
+    if (!strcmp(target, "/api/shifter/reset")) {
+        const char *v = form_value(pairs, n, "reset");
+        if (n != 1 || !v || strcmp(v, "1")) goto bad;
+        shifter_reset_counts();
+    } else if (!strcmp(target, "/api/shifter/centre")) {
+        const char *v = form_value(pairs, n, "centre");
+        if (n != 1 || !v || strcmp(v, "1")) goto bad;
+        shifter_request_centre();
+    } else if (!strcmp(target, "/api/shifter/thresholds")) {
+        float on, off;
+        if (n != 2 || parse_degrees(form_value(pairs, n, "on"), &on) || parse_degrees(form_value(pairs, n, "off"), &off) ||
+            shifter_set_thresholds(on, off)) goto bad;
+        if (shifter_options_save(SHIFTER_OPTIONS_PATH) != 0) goto save_failed;
+    } else if (!strcmp(target, "/api/shifter/test")) {
+        const char *v = form_value(pairs, n, "kind");
+        if (n != 1 || !v || shifter_request_test(!strcmp(v, "up") ? SHIFT_UP : !strcmp(v, "down") ? SHIFT_DOWN : SHIFT_NONE)) goto bad;
+    } else if (!strcmp(target, "/api/shifter/options")) {
+        const char *enabled = form_value(pairs, n, "enabled");
+        const char *names[3] = { "handbrake", "up", "down" };
+        unsigned long v[3] = { 0, 0, 0 };
+        int given = 1;
+        if (!enabled || (strcmp(enabled, "0") && strcmp(enabled, "1"))) goto bad;
+        for (int i = 0; i < 3; i++) {
+            const char *text = form_value(pairs, n, names[i]);
+            char *end;
+            if (!text) { if (i == 0) goto bad; continue; }   /* up/down are optional */
+            given++;
+            if (*text < '0' || *text > '9') goto bad;
+            errno = 0;
+            v[i] = strtoul(text, &end, 10);
+            if (errno || *end || !shifter_valid_button(v[i])) goto bad;
+        }
+        /* Optional, kept when absent: fast mode, handbrake lever and its angle. */
+        const char *fast = form_value(pairs, n, "fast"), *lever = form_value(pairs, n, "lever");
+        const char *lever_deg = form_value(pairs, n, "lever_deg");
+        if (fast && strcmp(fast, "0") && strcmp(fast, "1")) goto bad;
+        if (lever && strcmp(lever, "0") && strcmp(lever, "1")) goto bad;
+        if (!lever != !lever_deg) goto bad;
+        float deg = 0;
+        if (lever_deg && (parse_degrees(lever_deg, &deg) || deg < 3.0f || deg > 40.0f)) goto bad;
+        const char *hold = form_value(pairs, n, "lever_hold");
+        if (hold && (strlen(hold) != 1 || *hold < '0' || *hold >= '0' + SHIFTER_HOLD_COUNT)) goto bad;
+        if (n != given + (fast != NULL) + 2 * (lever != NULL) + (hold != NULL)) goto bad;
+        shifter_set_options(*enabled == '1', (uint32_t)v[0], (uint32_t)v[1], (uint32_t)v[2]);
+        if (fast) shifter_set_fast(*fast == '1');
+        if (lever && shifter_set_lever(*lever == '1', deg) != 0) goto bad;
+        if (hold) shifter_set_lever_hold(*hold - '0');
+        if (shifter_options_save(SHIFTER_OPTIONS_PATH) != 0) goto save_failed;
+    } else {
+        respond(cfd, "404 Not Found", "application/json", "{\"error\":\"Nao encontrado\"}");
+        return;
+    }
+    respond(cfd, "200 OK", "application/json", "{\"status\":\"ok\"}");
+    return;
+method_bad:
+    respond(cfd, "405 Method Not Allowed", "application/json", "{\"error\":\"Metodo nao suportado\"}");
+    return;
+bad:
+    respond(cfd, "400 Bad Request", "application/json", "{\"error\":\"Requisicao invalida\"}");
+    return;
+save_failed:
+    respond(cfd, "500 Internal Server Error", "application/json", "{\"error\":\"Nao foi possivel salvar no PS5\"}");
 }
 static int config_form(wheel_config_t *cfg, const form_pair_t *pairs, int n,
                        const char *prefix, uint32_t *mask) {
@@ -269,14 +436,17 @@ static void handle_client(int cfd) {
     body[body_len] = '\0';
     char *query = strchr(target, '?');
     if (query) *query++ = '\0';
+    if (!strncmp(target, "/api/shifter", 12)) { shifter_route(cfd, target, is_post, body); goto done; }
     int mutation = !strcmp(target, "/api/save") || !strcmp(target, "/api/reset") ||
         !strcmp(target, "/api/import") || !strcmp(target, "/api/gear/reset") ||
-        !strcmp(target, "/api/profiles/save") || !strcmp(target, "/api/profiles/load") || !strcmp(target, "/api/profiles/delete");
+        !strcmp(target, "/api/profiles/save") || !strcmp(target, "/api/profiles/load") || !strcmp(target, "/api/profiles/delete") ||
+        !strcmp(target, "/api/buttons/reset");
     if (is_post && !mutation) goto method_bad;
-    if (mutation && !is_post && strcmp(target, "/api/save")) goto method_bad;
+    /* Settings change only by POST: a link or image on another site must not alter them. */
+    if (mutation && !is_post) goto method_bad;
     if (mutation) {
         form_pair_t pairs[FORM_MAX];
-        int n = parse_form(is_post ? body : query, pairs);
+        int n = parse_form(body, pairs);
         if (n < 0) goto bad;
         wheel_config_t cfg; wheel_config_get(&cfg);
         uint32_t mask;
@@ -291,6 +461,9 @@ static void handle_client(int cfd) {
             const char *value = form_value(pairs, n, "gear");
             if (n != 1 || !value || (strcmp(value, "-1") && (strlen(value) != 1 || *value < '0' || *value > '8'))) goto bad;
             result = wheel_set_gear(atoi(value));
+        } else if (!strcmp(target, "/api/buttons/reset")) {
+            if (n != 1 || !form_value(pairs, n, "reset") || strcmp(form_value(pairs, n, "reset"), "1")) goto bad;
+            wheel_buttons_reset(); result = 0;
         } else if (!strcmp(target, "/api/import")) {
             result = import_backup(pairs, n);
             if (result == -2) goto bad;
@@ -313,17 +486,24 @@ static void handle_client(int cfd) {
         else respond(cfd, "200 OK", "application/json", "{\"status\":\"ok\"}");
     } else if (!strcmp(target, "/api/telemetry")) {
         wheel_telemetry_t t; wheel_telemetry_get(&t);
-        char json[768];
-        snprintf(json, sizeof(json),
-            "{\"connected\":%u,\"fresh\":%u,\"age_ms\":%u,\"raw_steer\":%u,\"raw_throttle\":%u,\"raw_brake\":%u,"
-            "\"steer\":%d,\"throttle\":%u,\"brake\":%u,\"gear\":%d,"
-            "\"paddle_l\":%u,\"paddle_r\":%u,\"btn_a\":%u,\"btn_b\":%u,"
-            "\"btn_x\":%u,\"btn_y\":%u,\"btn_up\":%u,\"btn_down\":%u,"
-            "\"btn_left\":%u,\"btn_right\":%u,\"btn_menu\":%u,\"btn_view\":%u,\"btn_xbox\":%u}",
-            t.connected,t.fresh,t.age_ms,t.raw_steer,t.raw_throttle,t.raw_brake,
-            t.steer_deg,t.throttle_pct,t.brake_pct,(int)t.gear,t.paddle_l,t.paddle_r,
-            t.btn_a,t.btn_b,t.btn_x,t.btn_y,t.btn_up,t.btn_down,t.btn_left,t.btn_right,t.btn_menu,t.btn_view,t.btn_xbox);
-        respond(cfd, "200 OK", "application/json", json);
+        char json[1536];
+        json_buffer_t buffer = { .data = json, .capacity = sizeof(json) };
+        telemetry_json(&buffer, &t);
+        respond_json(cfd, &buffer);
+    } else if (!strcmp(target, "/api/buttons")) {
+        /* Large snapshot: keep it off the server thread's stack. */
+        enum { BUTTONS_JSON_LIMIT = 98304 }; /* full ring with every button changing fits */
+        wheel_button_report_t *report = malloc(sizeof(*report));
+        char *json = malloc(BUTTONS_JSON_LIMIT);
+        if (!report || !json) {
+            free(report); free(json);
+            respond(cfd,"503 Service Unavailable","application/json","{\"error\":\"Memoria indisponivel\"}"); goto done;
+        }
+        wheel_buttons_get(report);
+        json_buffer_t buffer = { .data = json, .capacity = BUTTONS_JSON_LIMIT };
+        buttons_json(&buffer, report);
+        respond_json(cfd, &buffer);
+        free(report); free(json);
     } else if (!strcmp(target, "/api/diagnostics")) {
         wheel_diagnostics_t d; wheel_diagnostics_get(&d);
         char json[768];
@@ -351,6 +531,7 @@ static void handle_client(int cfd) {
         respond_json(cfd,&buffer); free(json);
     } else if (!strcmp(target, "/overlay")) respond(cfd,"200 OK","text/html; charset=utf-8",HTML_OVERLAY);
     else if (!strcmp(target, "/")) respond(cfd,"200 OK","text/html; charset=utf-8",HTML_CONFIG);
+    else if (!strcmp(target, "/cambio")) respond(cfd,"200 OK","text/html; charset=utf-8",HTML_SHIFTER);
     else respond(cfd,"404 Not Found","application/json","{\"error\":\"Pagina nao encontrada\"}");
     goto done;
 method_bad:
@@ -369,9 +550,12 @@ static void *web_server_thread(void *arg) {
         socklen_t clen = sizeof(cin);
         int cfd = accept(sfd, (struct sockaddr *)&cin, &clen);
         if (cfd >= 0) handle_client(cfd);
-        else if (errno != EINTR) {
+        else if (errno == EBADF || errno == EINVAL || errno == ENOTSOCK) {
             LOG("Erro no accept do web server: %d\n", errno);
             break;
+        } else if (errno != EINTR) {
+            /* Aborted connections or a full descriptor table pass; keep serving. */
+            usleep(100000);
         }
     }
     close(sfd);

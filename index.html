@@ -80,7 +80,7 @@
   <div class="test-body" id="ps5Controls" style="display:none">
     <div class="ps5-input-row">
       <label for="ps5IpInput" style="font-size:12px;color:var(--muted)">IP do PS5:</label>
-      <input type="text" id="ps5IpInput" value="192.168.15.50:8088" placeholder="ex: 192.168.15.50:8088">
+      <input type="text" id="ps5IpInput" value="192.168.1.50:8088" placeholder="ex: 192.168.1.50:8088">
       <button type="button" id="connectPs5Btn">Conectar Telemetria</button>
       <span id="ps5StatusMsg" style="font-size:11px;color:var(--muted)"></span>
     </div>
@@ -527,7 +527,7 @@ let livePolling = false;
 async function fetchPs5Telemetry(){
   if (state.mode !== 'live' || livePolling) return;
   livePolling = true;
-  const host = $('ps5IpInput').value.trim() || '192.168.15.50:8088';
+  const host = $('ps5IpInput').value.trim() || '192.168.1.50:8088';
   const url = (host.startsWith('http') ? host : `http://${host}`) + '/api/telemetry';
   try {
     const ac = new AbortController();

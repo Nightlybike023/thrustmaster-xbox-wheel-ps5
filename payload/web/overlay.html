@@ -15,6 +15,7 @@
 @media(max-width:360px){.toolbar button,.toolbar a,.view-controls summary{font-size:10px;padding:8px}.toolbar-group{gap:4px}.pedal-name{font-size:9px;letter-spacing:1px}.pedal-top{gap:5px}.gear-label{font-size:8px}.light-module .section-label{font-size:8px;letter-spacing:.6px}}
 
 .wake-bar{max-width:1260px;margin:0 auto 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}.wake-bar button{font-size:11px;padding:8px 10px;flex-shrink:0}.wake-bar button[data-state=native],.wake-bar button[data-state=video]{color:var(--green);border-color:#416450}.wake-bar p{margin:0;color:var(--muted);font-size:11px;line-height:1.5;flex:1;min-width:160px}.wake-bar button[data-state=retry]{color:var(--yellow)}
+.ps-btn.tap{background:var(--button);color:#11161d;border-color:var(--button)}.dp-btn.tap,.meta-btn.tap,.paddle.tap{background:var(--yellow);color:#14171c;border-color:var(--yellow)}.last-button{flex-basis:100%;margin:0;text-align:center;color:var(--muted);font-size:11px;line-height:1.5}.last-button[data-outcome=bad]{color:var(--red)}.instrument[data-state=idle] .pedal-val,.instrument[data-state=idle] .direction-number strong,.instrument[data-state=idle] .gear-num,.instrument[data-state=idle] #wheelSvg{opacity:.55}
 </style>
 </head>
 <body>
@@ -33,7 +34,7 @@
 </div><footer class="instrument-foot"><span class="live-indicator" id="dataStatus">Aguardando comandos</span><span>Marcha calculada pelas borboletas</span></footer>
 </section>
 <div class="adjust-row"><div class="gear-controls"><label for="resetGearValue">Alinhar marcha</label><select id="resetGearValue" aria-label="Marcha estimada para ajustar"><option value="1">1ª</option><option value="0">N</option><option value="-1">R</option><option value="2">2ª</option><option value="3">3ª</option><option value="4">4ª</option><option value="5">5ª</option><option value="6">6ª</option><option value="7">7ª</option><option value="8">8ª</option></select><button type="button" id="resetGear" disabled>Ajustar marcha</button><span id="gearMessage" role="status"></span></div><button type="button" class="controls-toggle" id="controlsToggle" aria-controls="controls" aria-expanded="false">Mostrar botões +</button></div>
-<section id="controls" class="controls" aria-label="Botões pressionados" hidden><div class="control-section"><span>Direcional</span><div class="dp-btn" id="btnUp" aria-label="Cima">↑</div><div class="dp-btn" id="btnDown" aria-label="Baixo">↓</div><div class="dp-btn" id="btnLeft" aria-label="Esquerda">←</div><div class="dp-btn" id="btnRight" aria-label="Direita">→</div></div><div class="control-section"><span>Botões</span><div class="ps-btn a" id="btnA" aria-label="Botão A">A</div><div class="ps-btn b" id="btnB" aria-label="Botão B">B</div><div class="ps-btn x" id="btnX" aria-label="Botão X">X</div><div class="ps-btn y" id="btnY" aria-label="Botão Y">Y</div></div><div class="control-section"><div class="meta-btn" id="btnView">VIEW</div><div class="meta-btn" id="btnMenu">MENU</div><div class="meta-btn" id="xboxStat">XBOX</div></div></section>
+<section id="controls" class="controls" aria-label="Botões pressionados" hidden><div class="control-section"><span>Direcional</span><div class="dp-btn" id="btnUp" aria-label="Cima">↑</div><div class="dp-btn" id="btnDown" aria-label="Baixo">↓</div><div class="dp-btn" id="btnLeft" aria-label="Esquerda">←</div><div class="dp-btn" id="btnRight" aria-label="Direita">→</div></div><div class="control-section"><span>Botões</span><div class="ps-btn a" id="btnA" aria-label="Botão A">A</div><div class="ps-btn b" id="btnB" aria-label="Botão B">B</div><div class="ps-btn x" id="btnX" aria-label="Botão X">X</div><div class="ps-btn y" id="btnY" aria-label="Botão Y">Y</div></div><div class="control-section"><div class="meta-btn" id="btnView">VIEW</div><div class="meta-btn" id="btnMenu">MENU</div><div class="meta-btn" id="xboxStat">XBOX</div></div><p class="last-button" id="lastButton" role="status">Nenhum botão registrado desde que os contadores foram zerados.</p></section>
 </main></div>
 <footer class="page-foot"><span>Leituras do volante · ângulo aproximado<br>As luzes acompanham o acelerador.</span><a href="/">Calibração e perfis ↗</a></footer>
 <button id="exitFocus" type="button">Sair do modo cockpit ↗</button>
@@ -138,16 +139,39 @@ document.addEventListener('fullscreenchange',()=>{$('fsBtn').lastChild.textConte
 addEventListener('resize',()=>setZoom(isAutoFit?1:currentZoom,false));
 function focusMode(on){document.body.classList.toggle('focus',on);$('viewMenu').open=false;}
 $('focusBtn').addEventListener('click',()=>focusMode(true));$('exitFocus').addEventListener('click',()=>focusMode(false));document.addEventListener('keydown',e=>{if(e.key==='Escape')focusMode(false);});
-$('controlsToggle').addEventListener('click',()=>{const open=$('controls').hidden;$('controls').hidden=!open;$('controlsToggle').textContent=open?'Ocultar botões −':'Mostrar botões +';$('controlsToggle').setAttribute('aria-expanded',String(open));});
+// Remember the button panel per device; storage may be unavailable on the console browser.
+function showControls(open){$('controls').hidden=!open;$('controlsToggle').textContent=open?'Ocultar botões −':'Mostrar botões +';$('controlsToggle').setAttribute('aria-expanded',String(open));}
+$('controlsToggle').addEventListener('click',()=>{const open=$('controls').hidden;showControls(open);try{localStorage.setItem('overlay.showButtons',open?'1':'0');}catch(e){}});
+try{if(localStorage.getItem('overlay.showButtons')==='1')showControls(true);}catch(e){}
 let pinchDist=0,pinchZoom=1;stage.addEventListener('touchstart',e=>{if(e.touches.length===2){pinchDist=Math.hypot(e.touches[0].pageX-e.touches[1].pageX,e.touches[0].pageY-e.touches[1].pageY);pinchZoom=currentZoom;}},{passive:true});stage.addEventListener('touchmove',e=>{if(e.touches.length===2&&pinchDist){e.preventDefault();setManualZoom(pinchZoom*Math.hypot(e.touches[0].pageX-e.touches[1].pageX,e.touches[0].pageY-e.touches[1].pageY)/pinchDist);}},{passive:false});for(const event of ['touchend','touchcancel'])stage.addEventListener(event,()=>pinchDist=0,{passive:true});
 let gearBusy=false,wheelFresh=false,running=!document.hidden,loopBusy=false,loopTimer=null;
 function status(state,text){$('connectionStatus').textContent=text;$('statusBadge').dataset.state=$('instrument').dataset.state=state;}
-function render(d){wheelFresh=Boolean(d.connected&&d.fresh);$('resetGear').disabled=gearBusy||!wheelFresh;status(wheelFresh?'live':d.connected?'idle':'offline',d.connected?(wheelFresh?'Volante conectado':'Sem comandos recentes'):'Volante desconectado');$('dataStatus').textContent=wheelFresh?'Comandos ao vivo':d.connected?'Aguardando movimento':'Volante desconectado';const value=key=>wheelFresh?(d[key]||0):0;
- const steer=Math.max(-120,Math.min(120,value('steer')));$('wheelSvg').style.transform='rotate('+steer+'deg)';$('degVal').textContent=wheelFresh?(steer>0?'+':'')+steer+'°':'—';
- for(const pedal of ['brake','throttle']){const pct=Math.max(0,Math.min(100,value(pedal)));$(pedal+'Fill').style.height=pct+'%';$(pedal+'Val').textContent=wheelFresh?pct+'%':'—';}
- $('gearNum').textContent=wheelFresh?(d.gear===0?'N':d.gear===-1?'R':d.gear):'—';$('padL').classList.toggle('active',Boolean(value('paddle_l')));$('padR').classList.toggle('active',Boolean(value('paddle_r')));
- for(const [id,key] of [['btnA','btn_a'],['btnB','btn_b'],['btnX','btn_x'],['btnY','btn_y'],['btnUp','btn_up'],['btnDown','btn_down'],['btnLeft','btn_left'],['btnRight','btn_right'],['btnMenu','btn_menu'],['btnView','btn_view'],['xboxStat','btn_xbox']])$(id).classList.toggle('active',Boolean(value(key)));
- const lit=Math.round(value('throttle')/10);for(let i=1;i<=10;i++)$('led'+i).classList.toggle('on',wheelFresh&&i<=lit);
+const BUTTON_VIEWS=[['btnA','btn_a','a','A'],['btnB','btn_b','b','B'],['btnX','btn_x','x','X'],['btnY','btn_y','y','Y'],['btnUp','btn_up','up','Cima'],['btnDown','btn_down','down','Baixo'],['btnLeft','btn_left','left','Esquerda'],['btnRight','btn_right','right','Direita'],['btnMenu','btn_menu','menu','Menu'],['btnView','btn_view','view','View'],['xboxStat','btn_xbox','xbox','Xbox'],['padL','paddle_l','paddle_l','Borboleta esquerda'],['padR','paddle_r','paddle_r','Borboleta direita']];
+let lastPresses=null;const tapTimers={};
+// Press counters reveal taps that started and ended between two polls.
+function flashTaps(presses){
+ if(!presses||typeof presses!=='object'){lastPresses=null;return;}
+ for(const [id,,key] of BUTTON_VIEWS){const before=lastPresses&&lastPresses[key],now=presses[key];if(Number.isInteger(before)&&Number.isInteger(now)&&now>before){$(id).classList.add('tap');clearTimeout(tapTimers[id]);tapTimers[id]=setTimeout(()=>$(id).classList.remove('tap'),350);}}
+ lastPresses=presses;
+}
+function showLastButton(d){
+ const el=$('lastButton'),view=BUTTON_VIEWS.find(v=>v[2]===d.last_button);
+ if(!view||!Number.isInteger(d.last_button_age_ms)||d.last_button_age_ms===4294967295){el.textContent='Nenhum botão registrado desde que os contadores foram zerados.';el.dataset.outcome='';return;}
+ const outcome=['aguardando envio','enviado ao PS5','falha no envio','não enviado'][d.last_outcome]||'';
+ el.textContent='Último botão: '+view[3]+' · há '+(d.last_button_age_ms/1000).toLocaleString('pt-BR',{maximumFractionDigits:1})+' s · '+outcome;el.dataset.outcome=d.last_outcome>1?'bad':'';
+}
+function render(d){wheelFresh=Boolean(d.connected&&d.fresh);
+ // The wheel only reports changes: with the USB link answering, the last reading is still what the PS5 receives.
+ const linkAlive=Boolean(d.connected)&&Number.isInteger(d.link_age_ms)&&d.link_age_ms<1500,shown=wheelFresh||linkAlive;
+ $('resetGear').disabled=gearBusy||!wheelFresh;
+ status(wheelFresh?'live':d.connected?'idle':'offline',d.connected?(wheelFresh?'Volante conectado':linkAlive?'Volante parado · USB ativo':'Sem comandos recentes'):'Volante desconectado');
+ $('dataStatus').textContent=wheelFresh?'Comandos ao vivo':linkAlive?'Última leitura mantida · volante parado':d.connected?'USB sem resposta recente':'Volante desconectado';const value=key=>shown?(d[key]||0):0;
+ const steer=Math.max(-120,Math.min(120,value('steer')));$('wheelSvg').style.transform='rotate('+steer+'deg)';$('degVal').textContent=shown?(steer>0?'+':'')+steer+'°':'—';
+ for(const pedal of ['brake','throttle']){const pct=Math.max(0,Math.min(100,value(pedal)));$(pedal+'Fill').style.height=pct+'%';$(pedal+'Val').textContent=shown?pct+'%':'—';}
+ $('gearNum').textContent=shown?(d.gear===0?'N':d.gear===-1?'R':d.gear):'—';
+ for(const [id,key] of BUTTON_VIEWS)$(id).classList.toggle('active',Boolean(value(key)));
+ flashTaps(d.presses);showLastButton(d);
+ const lit=Math.round(value('throttle')/10);for(let i=1;i<=10;i++)$('led'+i).classList.toggle('on',shown&&i<=lit);
 }
 $('resetGear').addEventListener('click',async()=>{if(gearBusy||!wheelFresh)return;gearBusy=true;$('resetGear').disabled=true;$('gearMessage').textContent='';const ac=new AbortController(),timeout=setTimeout(()=>ac.abort(),3000);try{const r=await fetch('/api/gear/reset',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({gear:$('resetGearValue').value}),signal:ac.signal});if(!r.ok)throw new Error();$('gearMessage').textContent='Contagem ajustada';}catch(e){$('gearMessage').textContent='Não foi possível ajustar';}finally{clearTimeout(timeout);gearBusy=false;$('resetGear').disabled=!wheelFresh;}});
 function updateLoop(){if(!running||loopBusy)return;loopBusy=true;loopTimer=null;const ac=new AbortController(),timeout=setTimeout(()=>ac.abort(),1200);fetch('/api/telemetry',{cache:'no-store',signal:ac.signal}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(render).catch(()=>{render({connected:0,fresh:0});status('offline','Sem conexão com o PS5');$('dataStatus').textContent='Tentando reconectar';}).finally(()=>{clearTimeout(timeout);loopBusy=false;if(running)loopTimer=setTimeout(updateLoop,40);});}

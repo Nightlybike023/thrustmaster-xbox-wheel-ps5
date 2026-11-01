@@ -36,7 +36,19 @@ static void *reader(void *unused) {
 int main(int argc, char **argv) {
     wheel_config_init_default();
     wheel_reset_state();
-    if (argc == 3 && !strcmp(argv[1], "--serve")) {
+    if ((argc == 3 || argc == 4) && !strcmp(argv[1], "--serve")) {
+        if (argc == 4) {
+            /* Worst case for /api/buttons: a full ring where every button changes. */
+            if (strcmp(argv[3], "--full-buttons")) return 1;
+            uint8_t all[12] = {0x20, 0, 1, 8, 0xfc, 0x3f, 0, 128, 0, 0, 0, 0};
+            struct usb_fs_endpoint fill_eps[2] = {0};
+            ScePadData pad;
+            for (int i = 0; i < WHEEL_EVENT_COUNT + 10; i++) {
+                all[2] = (uint8_t)(i % 255 + 1); all[4] = i % 2 ? 0 : 0xfc; all[5] = i % 2 ? 0 : 0x3f;
+                wheel_handle_packet(-1, fill_eps, all, sizeof(all), &pad);
+                wheel_diagnostics_injection(i % 3 ? 0 : -2147483647 - 1);
+            }
+        }
         if (web_server_start(atoi(argv[2])) != 0) return 2;
         for (;;) pause();
     }
@@ -237,7 +249,112 @@ int main(int argc, char **argv) {
     wheel_diagnostics_event(WHEEL_DISCONNECTED, 0); wheel_reset_state();
     wheel_diagnostics_get(&diag); assert(!diag.usb_found && !diag.virtual_ready && diag.rate_hz == 0);
     wheel_telemetry_get(&telemetry); assert(!telemetry.fresh);
+
+    /* Button instrumentation: edges, send outcome, GIP sequence gaps and USB polls. */
+    wheel_config_default(&cfg); assert(wheel_config_apply(&cfg) == 0);
+    wheel_reset_state(); wheel_buttons_reset();
+    wheel_diagnostics_event(WHEEL_READY, 0);
+    wheel_button_report_t *br = malloc(sizeof(*br));
+    assert(br);
+    uint8_t pkt[12] = {0x20, 0, 10, 8, 0, 0, 0, 128, 0, 0, 0, 0};
+    report(pkt, sizeof(pkt));                    /* nothing held: no event */
+    wheel_diagnostics_injection(0);
+    pkt[2] = 11; pkt[4] = 0x10; report(pkt, sizeof(pkt)); wheel_diagnostics_injection(0);  /* A down */
+    usleep(20000);
+    pkt[2] = 12; pkt[4] = 0; report(pkt, sizeof(pkt)); wheel_diagnostics_injection(0);     /* A up */
+    pkt[2] = 15; pkt[4] = 0x20; report(pkt, sizeof(pkt)); wheel_diagnostics_injection(-5); /* B down, 2 lost */
+    pkt[2] = 15; pkt[4] = 0x60; report(pkt, sizeof(pkt)); wheel_diagnostics_not_sent();    /* X down, repeated seq */
+    pkt[2] = 16; pkt[4] = 0x80; report(pkt, sizeof(pkt));                                  /* Y down, never injected */
+    pkt[2] = 17; pkt[4] = 0; pkt[5] = 0x20; report(pkt, sizeof(pkt)); wheel_diagnostics_injection(0);
+    uint8_t guide_down[5] = {0x07, 0, 1, 1, 1};
+    report(guide_down, sizeof(guide_down)); wheel_diagnostics_injection(0);
+    uint8_t status_pkt[8] = {0x03, 0, 1, 4, 0x80, 0, 0, 0};
+    assert(wheel_handle_packet(-1, eps, status_pkt, sizeof(status_pkt), &out) == 0);
+    assert(wheel_handle_packet(-1, eps, pkt, 8, &out) == 0);
+    wheel_diagnostics_usb_poll(WHEEL_POLL_TIMEOUT);
+    wheel_diagnostics_usb_poll(WHEEL_POLL_DISCARDED);
+    wheel_diagnostics_usb_poll(WHEEL_POLL_DATA);
+    wheel_telemetry_get(&telemetry);
+    assert(telemetry.link_age_ms < 1500 && telemetry.press_count[WHEEL_BTN_A] == 1);
+    assert(telemetry.last_button == WHEEL_BTN_XBOX && telemetry.last_outcome == WHEEL_SEND_OK && telemetry.last_button_age_ms < 1500);
+    wheel_buttons_get(br);
+    const wheel_button_stats_t *bs = br->buttons;
+    assert(bs[WHEEL_BTN_A].presses == 1 && bs[WHEEL_BTN_A].releases == 1 && bs[WHEEL_BTN_A].sent_ok == 1);
+    assert(bs[WHEEL_BTN_A].min_hold_ms >= 20 && bs[WHEEL_BTN_A].last_hold_ms == bs[WHEEL_BTN_A].min_hold_ms);
+    assert(bs[WHEEL_BTN_B].presses == 1 && bs[WHEEL_BTN_B].send_failed == 1 && bs[WHEEL_BTN_B].releases == 1);
+    assert(bs[WHEEL_BTN_X].presses == 1 && bs[WHEEL_BTN_X].not_sent == 1 && bs[WHEEL_BTN_X].sent_ok == 0);
+    assert(bs[WHEEL_BTN_Y].presses == 1 && bs[WHEEL_BTN_Y].not_sent == 1 && bs[WHEEL_BTN_Y].releases == 1);
+    assert(bs[WHEEL_BTN_PADDLE_R].sent_ok == 1 && bs[WHEEL_BTN_XBOX].sent_ok == 1);
+    assert(br->seq_lost == 2 && br->seq_repeated == 1 && br->sessions == 1);
+    assert(br->other_packets == 1 && br->last_other_cmd == 0x03 && br->last_other_len == 8 && br->short_packets == 1);
+    assert(br->usb_polls == 3 && br->usb_timeouts == 1 && br->usb_discarded == 1);
+    assert(br->event_total == 7 && br->event_count == 7);
+    assert(br->events[0].pressed == 1u << WHEEL_BTN_A && br->events[0].seq == 11 && br->events[0].outcome == WHEEL_SEND_OK);
+    assert(br->events[1].released == 1u << WHEEL_BTN_A && br->events[1].hold_ms >= 20);
+    assert(br->events[2].seq_lost == 2 && br->events[2].outcome == WHEEL_SEND_FAILED && br->events[2].inject_result == -5);
+    assert(br->events[2].pad_buttons & SCE_PAD_BUTTON_CIRCLE);
+    assert(br->events[4].outcome == WHEEL_SEND_SKIPPED && br->events[6].cmd == 0x07);
+    assert(br->events[6].held == ((1u << WHEEL_BTN_PADDLE_R) | (1u << WHEEL_BTN_XBOX)));
+    /* A reconnect keeps the counters but starts a new sequence and link. */
+    wheel_reset_state();
+    wheel_telemetry_get(&telemetry);
+    assert(telemetry.link_age_ms == UINT32_MAX && telemetry.press_count[WHEEL_BTN_A] == 1);
+    memset(pkt + 4, 0, 8);
+    const uint8_t wrap[] = {254, 255, 1, 2};
+    for (size_t i = 0; i < sizeof(wrap); i++) { pkt[2] = wrap[i]; report(pkt, sizeof(pkt)); }
+    wheel_buttons_get(br); assert(br->seq_lost == 2);
+    pkt[2] = 4; report(pkt, sizeof(pkt));
+    wheel_buttons_get(br); assert(br->seq_lost == 3);
+    /* The ring keeps the newest events in order. */
+    for (int i = 0; i < 200; i++) {
+        pkt[2] = (uint8_t)(5 + i % 200); pkt[4] = i % 2 ? 0 : 0x10;
+        report(pkt, sizeof(pkt)); wheel_diagnostics_injection(0);
+    }
+    wheel_buttons_get(br);
+    assert(br->event_total == 207 && br->event_count == WHEEL_EVENT_COUNT);
+    assert(br->events[0].id == 80 && br->events[WHEEL_EVENT_COUNT - 1].id == 207);
+    assert(br->buttons[WHEEL_BTN_A].presses == 101 && br->buttons[WHEEL_BTN_A].sent_ok == 101 && br->seq_lost == 3);
+    wheel_buttons_reset();
+    wheel_buttons_get(br); wheel_telemetry_get(&telemetry);
+    assert(!br->event_total && !br->event_count && !br->buttons[WHEEL_BTN_A].presses && !br->seq_lost);
+    assert(telemetry.last_button == -1 && !telemetry.press_count[WHEEL_BTN_A]);
+    for (unsigned i = 0; i < WHEEL_BTN_COUNT; i++) assert(wheel_button_name(i));
+    assert(!wheel_button_name(WHEEL_BTN_COUNT));
+    free(br);
+    puts("PASS: button edges, send outcomes, hold times, GIP sequence gaps and wrap, short/other packets, USB polls, event ring and counter reset");
     puts("PASS: calibrated steering/pedals, curves, sensitivity, smoothing reset, raw freshness, eight persistent profiles, atomic backup failures, defaults and diagnostics");
+
+    /* PS Move shifter: extra buttons ride on the wheel's report and can be resent alone. */
+    wheel_reset_state();
+    ScePadData shifted;
+    assert(!wheel_compose_pad(SCE_PAD_BUTTON_R1, &shifted));       /* no wheel report yet */
+    uint8_t move_pkt[12] = {0x20, 0, 1, 8, 0, 0, 0, 128, 0, 0, 0, 0};
+    ScePadData from_wheel;
+    wheel_parse_input(move_pkt, &from_wheel);
+    assert(from_wheel.buttons & SCE_PAD_BUTTON_R1);                   /* still held from above */
+    assert(wheel_compose_pad(SCE_PAD_BUTTON_L1, &shifted));
+    assert((shifted.buttons & SCE_PAD_BUTTON_L1) && !(shifted.buttons & SCE_PAD_BUTTON_R1));
+    assert(shifted.leftStick.x == from_wheel.leftStick.x);
+    assert(wheel_compose_pad(SCE_PAD_BUTTON_R2, &shifted) && shifted.analogButtons.r2 == 255);
+    assert(wheel_compose_pad(0, &shifted) && !(shifted.buttons & (SCE_PAD_BUTTON_L1 | SCE_PAD_BUTTON_R2)));
+    assert(shifted.analogButtons.r2 == from_wheel.analogButtons.r2);
+    wheel_parse_input(move_pkt, &from_wheel);
+    assert(!(from_wheel.buttons & SCE_PAD_BUTTON_R1));
+    wheel_telemetry_get(&telemetry);
+    int gear = telemetry.gear;
+    wheel_virtual_shift(1); wheel_virtual_shift(1); wheel_virtual_shift(0);
+    wheel_telemetry_get(&telemetry);
+    assert(telemetry.gear == gear + 1);
+    /* The Guide packet must not bring back a shift button that was already released. */
+    for (int i = 0; i < 6; i++) { move_pkt[2] = (uint8_t)(10 + i); assert(wheel_handle_packet(-1, eps, move_pkt, sizeof(move_pkt), &from_wheel) == 1); }
+    assert(wheel_compose_pad(SCE_PAD_BUTTON_R1, &shifted) && (shifted.buttons & SCE_PAD_BUTTON_R1));
+    move_pkt[2] = 16; wheel_handle_packet(-1, eps, move_pkt, sizeof(move_pkt), &from_wheel);
+    assert(wheel_compose_pad(0, &shifted));
+    uint8_t guide_pkt[5] = {0x07, 0, 1, 1, 1};
+    ScePadData guided; memset(&guided, 0, sizeof(guided));
+    assert(wheel_handle_packet(-1, eps, guide_pkt, sizeof(guide_pkt), &guided) == 1);
+    assert(!(guided.buttons & SCE_PAD_BUTTON_R1) && (guided.buttons & SCE_PAD_BUTTON_PS));
+    puts("PASS: PS Move shifter extra buttons, resend without the wheel, gear count, Guide after a shift");
 
     puts("PASS: packets, Guide state, pedals, shifting, config persistence, snapshots, handshake failures");
     return 0;

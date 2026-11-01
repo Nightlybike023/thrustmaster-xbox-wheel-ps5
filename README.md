@@ -17,6 +17,8 @@ https://github.com/user-attachments/assets/6583b1c2-3d3d-4f2e-9e79-689121fea4a3
 
 
 
+**Câmbio e freio de mão com PS Move (volante 458 Spider):** veja [CAMBIO_PS_MOVE.md](CAMBIO_PS_MOVE.md).
+
 ## Features
 
 - 60Hz input streaming from USB HID controller → virtual DualSense

@@ -88,17 +88,18 @@ try:
     assert b"400 Bad Request" in raw([b"GET / HTTP/invalid\r\n\r\n"])
     assert b"431 Request Header Fields Too Large" in raw([b"GET / HTTP/1.1\r\nX: " + b"x" * 4080])
     for query in ("deadzone=-1", "deadzone=2001", "deadzone=1x", "btn_a=3", "invert_pedals=2", "unknown=0", "deadzone=777&btn_a=-1"):
-        get("/api/save?" + query, 400)
+        post("/api/save", dict(urllib.parse.parse_qsl(query)), 400)
     assert json.loads(get("/api/config")) == config
-    assert json.loads(get("/api/save?deadzone=368"))["status"] == "ok"
+    assert post("/api/save", {"deadzone": 368})["status"] == "ok"
     obstruction = pathlib.Path(config_dir) / "wheel_config.txt.tmp"
     obstruction.mkdir()
     try:
-        assert "error" in json.loads(get("/api/save?deadzone=999", 500))
+        assert "error" in post("/api/save", {"deadzone": 999}, 500)
         assert json.loads(get("/api/config"))["deadzone"] == 368
     finally:
         obstruction.rmdir()
-    assert json.loads(get("/api/save?deadzone=777&invert_pedals=1"))["status"] == "ok"
+    assert post("/api/save", {"deadzone": 777, "invert_pedals": 1})["status"] == "ok"
+    get("/api/save?deadzone=400", 405)   # a link must not change settings
     assert json.loads(get("/api/config"))["deadzone"] == 777
     post("/api/save", {"sensitivity": 125, "curve": 1, "smoothing_ms": 10})
     current = json.loads(get("/api/config"))
@@ -140,12 +141,80 @@ try:
     post("/api/profiles/delete", {"slot": 8}); post("/api/profiles/load", {"slot": 8}, 404)
     assert json.loads(get("/api/profiles"))["profiles"][7] is None
     assert json.loads(get("/api/diagnostics"))["injection_attempts"] == 0
+    telemetry = json.loads(get("/api/telemetry"))
+    assert telemetry["last_button"] is None and telemetry["link_age_ms"] == 4294967295
+    assert set(telemetry["presses"]) == {"a", "b", "x", "y", "menu", "view", "up", "down", "left", "right", "paddle_l", "paddle_r", "xbox"}
+    buttons = json.loads(get("/api/buttons"))
+    assert buttons["events"] == [] and buttons["seq_lost"] == 0 and buttons["buttons"]["a"]["presses"] == 0
+    assert post("/api/buttons/reset", {"reset": 1})["status"] == "ok"
+    post("/api/buttons/reset", {"reset": 2}, 400)
+    get("/api/buttons/reset", 405)
     get("/api/import", 405)
+    shifter = json.loads(get("/api/shifter"))
+    assert shifter["enabled"] == 0 and shifter["handbrake"] == 0 and shifter["sent"] == 0
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 16384})
+    shifter = json.loads(get("/api/shifter"))
+    assert shifter["enabled"] == 1 and shifter["handbrake"] == 16384
+    assert "enabled=1" in (pathlib.Path(config_dir) / "move_shifter.txt").read_text()
+    post("/api/shifter/options", {"enabled": 2, "handbrake": 0}, 400)
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 3}, 400)
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "up": 4096, "down": 16384})
+    shifter = json.loads(get("/api/shifter"))
+    assert shifter["up"] == 4096 and shifter["down"] == 16384
+    assert "up=4096" in (pathlib.Path(config_dir) / "move_shifter.txt").read_text()
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "up": 3}, 400)
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "side": 2}, 400)
+    post("/api/shifter/options", {"enabled": 1}, 400)
+    post("/api/shifter/thresholds", {"on": 8, "off": 4})
+    assert "step=8.0" in (pathlib.Path(config_dir) / "move_shifter.txt").read_text()
+    post("/api/shifter/test", {"kind": "up"}); post("/api/shifter/test", {"kind": "side"}, 400)
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "fast": 1})
+    assert json.loads(get("/api/shifter"))["fast"] == 1 and "fast=1" in (pathlib.Path(config_dir) / "move_shifter.txt").read_text()
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "fast": 2}, 400)
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 32768, "lever": 1, "lever_deg": 10})
+    shifter = json.loads(get("/api/shifter"))
+    assert shifter["lever"] == 1 and shifter["lever_deg"] == 10 and shifter["lever_pulled"] == 0
+    assert "lever=1" in (pathlib.Path(config_dir) / "move_shifter.txt").read_text()
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "lever": 1}, 400)
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "lever": 1, "lever_deg": 2}, 400)
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "lever": 1, "lever_deg": "nan"}, 400)
+    post("/api/shifter/thresholds", {"on": "inf", "off": 2}, 400)
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "lever": 1, "lever_deg": 8, "lever_hold": 1})
+    assert json.loads(get("/api/shifter"))["lever_hold"] == 1
+    assert "lever_hold=1" in (pathlib.Path(config_dir) / "move_shifter.txt").read_text()
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "lever_hold": 7}, 400)
+    post("/api/shifter/options", {"enabled": 1, "handbrake": 0, "lever": 0, "lever_deg": 8, "lever_hold": 0})
+    post("/api/shifter/options", {"enabled": 0, "handbrake": 0})
+    assert b"PS Move" in get("/cambio")
     for route in ("/", "/overlay"):
         assert get(route).startswith(b"<!DOCTYPE html>")
     with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
         sock.sendall(b"GET /overlay HTTP/1.1\r\nHost: localhost\r\n\r\n")
     assert get("/api/config") and process.poll() is None
+    # A full event ring with every button changing must still be valid JSON.
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        full_port = sock.getsockname()[1]
+    full = subprocess.Popen([binary, "--serve", str(full_port), "--full-buttons"], stdout=subprocess.DEVNULL)
+    try:
+        for _ in range(100):
+            try:
+                response = urllib.request.urlopen(f"http://127.0.0.1:{full_port}/api/buttons", timeout=3)
+                break
+            except OSError:
+                time.sleep(0.03)
+        else:
+            raise RuntimeError("Full-button server did not start")
+        with response:
+            assert response.status == 200
+            full_buttons = json.loads(response.read())
+        assert len(full_buttons["events"]) == 128 and full_buttons["event_total"] == 138
+        assert len(full_buttons["events"][-1]["held"]) in (0, 12)
+        assert any(e["inject_result"] == -2147483648 for e in full_buttons["events"])
+        assert full_buttons["buttons"]["a"]["presses"] == 69
+    finally:
+        full.terminate()
+        full.wait(timeout=3)
     print("PASS: profiles, export/import, malformed backups, POST fragments, gear reset, defaults, diagnostics; HTTP fragments, exact routes, response lengths, validation, atomic saves, save failures, closed peers")
 finally:
     process.terminate()

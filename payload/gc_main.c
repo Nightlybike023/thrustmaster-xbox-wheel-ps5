@@ -13,6 +13,7 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +49,8 @@
 #include "controller_wheel.h"
 #include "web_server.h"
 #include "instance_guard.h"
+#include "controller_move.h"
+#include "shifter.h"
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
 #define LOG_DIR  "/data/ghostpad"
@@ -212,11 +215,23 @@ static void *klog_capture_thread(void *arg) {
 }
 
 /* ── VDI injection ────────────────────────────────────────────────────── */
+static pthread_mutex_t g_inject_lock = PTHREAD_MUTEX_INITIALIZER;
+static void inject_pad_locked(int slot, const ScePadData *pad);
+/* The USB reader and the PS Move shifter both feed the wheel's virtual pad. */
 static void inject_pad(int slot, const ScePadData *pad) {
+    pthread_mutex_lock(&g_inject_lock);
+    inject_pad_locked(slot, pad);
+    pthread_mutex_unlock(&g_inject_lock);
+}
+static void inject_pad_locked(int slot, const ScePadData *pad) {
     int32_t h = g_slots[slot].handle;
-    if (h < 0 || !g_slots[slot].vdi_ready) return;
+    int is_wheel = g_slots[slot].vid == WHEEL_VID && g_slots[slot].pid == WHEEL_PID;
+    if (h < 0 || !g_slots[slot].vdi_ready) {
+        if (is_wheel) wheel_diagnostics_not_sent();
+        return;
+    }
     int vr = scePadVirtualDeviceInsertData(h, pad);
-    if (g_slots[slot].vid == WHEEL_VID && g_slots[slot].pid == WHEEL_PID) wheel_diagnostics_injection(vr);
+    if (is_wheel) wheel_diagnostics_injection(vr);
     uint32_t n = ++g_slots[slot].inject_count;
     if ((n % 600) == 0)
         gp_log("slot[%d] VDI #%u ret=0x%08x\n", slot, n, (uint32_t)vr);
@@ -553,13 +568,20 @@ main_loop: ;
             gp_log("slot[%d] USB completion wait failed errno=%d\n",slot,cerr);
             goto reinit;
         }
-        if (eps[0].status == USB_ERR_TIMEOUT) continue;
+        if (eps[0].status == USB_ERR_TIMEOUT) {
+            if (pid == PID_WHEEL) wheel_diagnostics_usb_poll(WHEEL_POLL_TIMEOUT);
+            continue;
+        }
         if (eps[0].status != USB_ERR_NORMAL_COMPLETION) {
             if (pid == PID_WHEEL) wheel_diagnostics_event(WHEEL_ERROR, eps[0].status);
             gp_log("slot[%d] USB input status=%d — reinitializing\n", slot, eps[0].status);
             goto reinit;
         }
-        if(eps[0].aFrames != 1 || lengths[0]<1 || lengths[0]>sizeof(buf)) continue;
+        if(eps[0].aFrames != 1 || lengths[0]<1 || lengths[0]>sizeof(buf)) {
+            if (pid == PID_WHEEL) wheel_diagnostics_usb_poll(WHEEL_POLL_DISCARDED);
+            continue;
+        }
+        if (pid == PID_WHEEL) wheel_diagnostics_usb_poll(WHEEL_POLL_DATA);
 
         uint32_t len = lengths[0];
 
@@ -608,7 +630,11 @@ uninit_exit:
 exit_slot:
     if (pid == PID_WHEEL) { wheel_reset_state(); wheel_diagnostics_event(WHEEL_DISCONNECTED, 0); }
     gp_log("slot[%d] USB thread exiting — freeing slot\n", slot);
+    /* The PS Move thread also injects: no insert may race the deletion. */
+    pthread_mutex_lock(&g_inject_lock);
+    g_slots[slot].vdi_ready = 0;
     scePadVirtualDeviceDeleteDevice(g_slots[slot].handle);
+    pthread_mutex_unlock(&g_inject_lock);
     pthread_mutex_lock(&g_slot_lock);
     g_slots[slot].handle    = -1;
     g_slots[slot].vdi_ready = 0;
@@ -769,6 +795,188 @@ static void *controller_manager_thread(void *arg) {
     return NULL;
 }
 
+/* ── PS Move over Bluetooth (/dev/hid) ────────────────────────────────── */
+/* ioctl layouts match the RPCS3 Move handler that is verified on this console. */
+typedef struct { uint32_t handle, arg1, arg2; } hid_open_req;
+typedef struct { uint32_t type, handle; } hid_close_req;
+typedef struct { uint8_t report_id, r, g, b, pad0, pad1, rumble, pad2; } hid_led_payload;
+typedef struct { uint32_t driver_handle, pad; void *p_payload; } hid_set_led_req;
+typedef struct { uint32_t driver_handle, pad0; void *buffer; uint32_t max_reports, pad1; int32_t *p_count; } hid_read_req;
+#define HID_IOCTL_OPEN  0x800c4802u
+#define HID_IOCTL_CLOSE 0x80084803u
+#define HID_IOCTL_LED   0x80104839u
+#define HID_IOCTL_READ  0xc0204834u
+#define MOVE_LED_R 255
+#define MOVE_LED_G 0
+#define MOVE_LED_B 255
+
+static int move_set_led(int fd, uint32_t dh, uint8_t r, uint8_t g, uint8_t b) {
+    hid_led_payload led = { 1, r, g, b, 0, 0, 0, 0 };
+    hid_set_led_req req = { dh, 0, &led };
+    return ioctl(fd, HID_IOCTL_LED, &req);
+}
+
+static int move_read(int fd, uint32_t dh, uint8_t *buf, uint32_t max_reports) {
+    int32_t count = 0;
+    hid_read_req req = { dh, 0, buf, max_reports, 0, &count };
+    return ioctl(fd, HID_IOCTL_READ, &req);
+}
+
+/* Scan Bluetooth HID handles 1..8 (0 is the DualSense). Accept a handle when the
+ * LED command succeeds or input reports already arrive. Returns driver handle or 0. */
+static uint32_t move_connect(int fd) {
+    for (uint32_t h = 1; h <= 8; h++) {
+        hid_open_req oreq = { h, 3, 1 };
+        int dh = ioctl(fd, HID_IOCTL_OPEN, &oreq);
+        if (dh <= 0) continue;
+        int r = move_set_led(fd, (uint32_t)dh, MOVE_LED_R, MOVE_LED_G, MOVE_LED_B);
+        int rr = 0;
+        if (r != 0) { uint8_t probe[64]; rr = move_read(fd, (uint32_t)dh, probe, 1); }
+        if (r == 0 || rr > 0) {
+            /* Other Bluetooth pads also answer here: keep the handle only if it streams
+             * Move reports (id 0x01 and an accelerometer reading near 1 g). */
+            static uint8_t probe[16 * MOVE_KERNEL_REPORT_SIZE];
+            int is_move = 0, seen = 0;
+            for (int tries = 0; tries < 100 && !is_move; tries++) {
+                int n = move_read(fd, (uint32_t)dh, probe, 16);
+                for (int i = 0; i < n && i < 16; i++) {
+                    move_input in;
+                    seen++;
+                    if (!move_parse_report(probe + i * MOVE_KERNEL_REPORT_SIZE, &in)) continue;
+                    float g = sqrtf(in.accel[0] * in.accel[0] + in.accel[1] * in.accel[1] + in.accel[2] * in.accel[2]);
+                    if (g > 0.5f && g < 2.0f) { is_move = 1; break; }
+                }
+                usleep(10000);
+            }
+            if (is_move) {
+                gp_log("move: PS Move on BT handle %u (dh=0x%08x led=%d)\n", h, (uint32_t)dh, r);
+                return (uint32_t)dh;
+            }
+            gp_log("move: BT handle %u is not a PS Move (%d reports, id=0x%02x); skipping\n", h, seen, probe[MOVE_HID_OFFSET]);
+        }
+        hid_close_req creq = { 3, (uint32_t)dh };
+        ioctl(fd, HID_IOCTL_CLOSE, &creq);
+    }
+    return 0;
+}
+
+/* Wheel slot that has a virtual pad, or -1. */
+static int wheel_slot(void) {
+    int found = -1;
+    pthread_mutex_lock(&g_slot_lock);
+    for (int s = 0; s < MAX_SLOTS && found < 0; s++)
+        if (g_slots[s].vid == WHEEL_VID && g_slots[s].pid == WHEEL_PID && g_slots[s].handle >= 0 && g_slots[s].vdi_ready) found = s;
+    pthread_mutex_unlock(&g_slot_lock);
+    return found;
+}
+
+/* Hold the extra buttons on the wheel's virtual pad and send the result now. */
+static void shifter_send(uint32_t extra) {
+    int slot = wheel_slot();
+    ScePadData pad;
+    /* Keep the wheel report as composed, timestamp included: the wheel's own reports
+     * carry 0, and a mix of clocks on one virtual pad was ignored by Project CARS. */
+    if (wheel_compose_pad(extra, &pad) && slot >= 0) inject_pad(slot, &pad);
+}
+
+#define SHIFT_PRESS_US 150000u  /* about as long as a quick pull of the real paddle */
+
+/* PS Move shifter / handbrake lever: reads the Move, recognises shifts (or the lever
+ * pull) and holds the chosen buttons on the wheel's virtual pad. Does nothing to the
+ * game while the option is off, and only scans Bluetooth while it is in use. */
+static void *move_shifter_thread(void *arg) {
+    (void)arg;
+    int fd = -1;
+    uint32_t dh = 0, extra = 0, shift_bit = 0;
+    uint64_t last_input = 0, last_led = 0, last_log = 0, release_at = 0;
+    static uint8_t reports[16 * MOVE_KERNEL_REPORT_SIZE];
+
+    gp_log("move: shifter thread started\n");
+    while (1) {
+        if (fd < 0) {
+            fd = open("/dev/hid", O_RDWR);
+            if (fd < 0) { gp_log("move: /dev/hid errno=%d\n", errno); usleep(2000000); continue; }
+        }
+        if (!dh) {
+            /* Leave Bluetooth pads alone unless the Move is in use or being set up. */
+            if (!shifter_wanted(shifter_now_us())) { usleep(1000000); continue; }
+            dh = move_connect(fd);
+            if (!dh) { usleep(1000000); continue; }
+            last_input = last_led = shifter_now_us();
+            notify("Cambio PS Move conectado");
+        }
+
+        int r = move_read(fd, dh, reports, 16);
+        uint64_t t = shifter_now_us();
+        shifter_status st;
+        shifter_get(&st, t);
+        wheel_config_t cfg;
+        wheel_config_get(&cfg);
+        uint32_t handbrake = 0;
+        int lever_held = 0;   /* the button chosen to go with the handbrake pull */
+        if (r > 0) {
+            int n = r > 16 ? 16 : r;
+            for (int i = 0; i < n; i++) {
+                move_input cur;
+                if (!move_parse_report(reports + i * MOVE_KERNEL_REPORT_SIZE, &cur)) continue;
+                /* Two IMU samples per report at ~87 Hz. */
+                shifter_buttons b = { cur.trigger, cur.t_button, cur.move, cur.cross, cur.circle, cur.square, cur.triangle };
+                /* Either sample can complete a shift: keep both results. */
+                int first = shifter_update(cur.accel1, cur.gyro1, &b, t - 5750);
+                int kind = shifter_update(cur.accel, cur.gyro, &b, t);
+                if (!kind) kind = first;
+                if (!kind) kind = shifter_take_test();
+                if (kind && st.enabled) {
+                    /* A new shift replaces one still being held. */
+                    /* Games that ignore the paddles get the buttons chosen on /cambio. */
+                    if (kind == SHIFT_UP) shift_bit = st.up_button ? st.up_button : cfg.btn_paddle_r;
+                    else shift_bit = st.down_button ? st.down_button : cfg.btn_paddle_l;
+                    release_at = t + SHIFT_PRESS_US;
+                    wheel_virtual_shift(kind == SHIFT_UP);
+                    shifter_count_sent();
+                }
+                if (st.enabled && !st.lever && st.handbrake && cur.trigger > 100) handbrake = st.handbrake;
+                lever_held = shifter_hold_pressed(st.lever_hold, &b);
+            }
+            last_input = t;
+            if (t - last_log > 10000000u) { last_log = t; gp_log("move: tilt=%.1f level=%.1f ups=%u downs=%u enabled=%d\n", st.tilt_deg, st.level_deg, st.ups, st.downs, st.enabled); }
+        } else {
+            handbrake = extra & st.handbrake;  /* no new report: keep the handbrake as it was */
+            if (r < 0 && (errno == ENODEV || errno == EBADF)) {
+                gp_log("move: read failed errno=%d; reconnecting\n", errno);
+                shifter_disconnected();
+                if (extra) shifter_send(extra = 0);
+                dh = 0; continue;
+            }
+        }
+        if (r > 0) {
+            /* Handbrake lever: held for as long as the Move stays pulled back. */
+            shifter_status now_st;
+            shifter_get(&now_st, t);
+            if (now_st.enabled && now_st.lever && now_st.lever_pulled && lever_held) handbrake = now_st.handbrake;
+        }
+        if (shift_bit && t >= release_at) shift_bit = 0;
+        uint32_t want = shift_bit | handbrake;
+        if (!st.enabled) want = 0;
+        if (want != extra) shifter_send(extra = want);
+
+        /* Keep the sphere lit; the Move turns its LED off without periodic output. */
+        if (t - last_led > 500000u) { move_set_led(fd, dh, MOVE_LED_R, MOVE_LED_G, MOVE_LED_B); last_led = t; }
+
+        if (t - last_input > 8000000u) {
+            gp_log("move: no input for 8 s; reconnecting\n");
+            hid_close_req creq = { 3, dh };
+            ioctl(fd, HID_IOCTL_CLOSE, &creq);
+            shifter_disconnected();
+            if (extra) shifter_send(extra = 0);
+            dh = 0;
+            continue;
+        }
+        usleep(4000);
+    }
+    return NULL;
+}
+
 /* ── Credential elevation ─────────────────────────────────────────────── */
 static void elevate_credentials(void) {
     pid_t p = getpid();
@@ -790,6 +998,8 @@ int main(void) {
     }
     wheel_config_load();
     wheel_reset_state();
+    shifter_init();
+    shifter_options_load(SHIFTER_OPTIONS_PATH);
     /* A legacy payload without the lock may still own 8088. Do not start a
      * second USB reader or terminate an unverified PID in that case. */
     if (web_server_start(8088) != 0) {
@@ -849,6 +1059,11 @@ int main(void) {
     if (pthread_create(&mgr_tid, NULL, controller_manager_thread, NULL)==0) {
         pthread_detach(mgr_tid);
         gp_log("Manager thread started\n");
+    }
+    pthread_t move_tid;
+    if (pthread_create(&move_tid, NULL, move_shifter_thread, NULL)==0) {
+        pthread_detach(move_tid);
+        gp_log("PS Move shifter thread started\n");
     }
 
     gp_log("Web server configurator active on port 8088\n");

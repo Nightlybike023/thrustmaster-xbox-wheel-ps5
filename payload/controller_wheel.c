@@ -29,17 +29,51 @@ static wheel_diagnostics_t g_diagnostics;
 static pthread_mutex_t g_wheel_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_config_save_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_input_count;
-static ScePadData g_last_pad;
+/* Buttons pressed on top of the wheel by the PS Move shifter, and the wheel's own
+ * last report without them: the Guide packet and the shifter rebuild from it. */
+static uint32_t g_extra_buttons;
+static ScePadData g_wheel_pad;
+static int g_wheel_pad_valid;
 static uint8_t g_guide_pressed, g_prev_pad_r, g_prev_pad_l;
 static int8_t g_gear = 1;
 static uint64_t g_last_input_us, g_last_steer_us, g_rate_start_us, g_rate_packets;
 static float g_filtered_steer;
 static int g_filter_valid;
 
+/* Button instrumentation survives reconnects so USB ports can be compared;
+ * only wheel_buttons_reset() clears it. Everything is guarded by g_wheel_lock. */
+static struct {
+    wheel_button_stats_t stats[WHEEL_BTN_COUNT];
+    wheel_button_event_t events[WHEEL_EVENT_COUNT];
+    uint32_t total, sessions;
+    int pending;            /* ring slot awaiting its injection result, or -1 */
+    int8_t last_button;
+    uint8_t last_outcome, last_other_cmd, last_other_len;
+    uint64_t start_us, pending_us, last_button_us;
+    uint64_t usb_polls, usb_timeouts, usb_discarded;
+    uint64_t short_packets, other_packets, seq_lost, seq_repeated;
+} g_btn = { .pending = -1, .last_button = -1 };
+/* Per-USB-session state, cleared by wheel_reset_state(). */
+static uint16_t g_held;
+static uint8_t g_seq_prev, g_seq_valid;
+static uint64_t g_link_us, g_press_us[WHEEL_BTN_COUNT];
+
+static const char *const button_names[WHEEL_BTN_COUNT] = {
+    "a", "b", "x", "y", "menu", "view", "up", "down", "left", "right", "paddle_l", "paddle_r", "xbox"
+};
+const char *wheel_button_name(unsigned index) {
+    return index < WHEEL_BTN_COUNT ? button_names[index] : NULL;
+}
+
 static uint64_t now_us(void) {
     struct timespec t;
     if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
     return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
+static uint32_t ms_since(uint64_t then, uint64_t now) {
+    if (!then || now < then) return UINT32_MAX;
+    uint64_t ms = (now - then) / 1000;
+    return ms > UINT32_MAX ? UINT32_MAX : (uint32_t)ms;
 }
 
 void wheel_config_default(wheel_config_t *out) {
@@ -165,15 +199,124 @@ void wheel_backup_get(wheel_config_t *cfg, wheel_profile_t profiles[WHEEL_PROFIL
     pthread_mutex_unlock(&g_config_save_lock);
 }
 static uint32_t input_age_locked(void) {
-    uint64_t now = now_us();
-    uint64_t age = g_last_input_us && now >= g_last_input_us ? (now - g_last_input_us) / 1000 : UINT32_MAX;
-    return age > UINT32_MAX ? UINT32_MAX : (uint32_t)age;
+    return ms_since(g_last_input_us, now_us());
 }
 void wheel_telemetry_get(wheel_telemetry_t *out) {
     pthread_mutex_lock(&g_wheel_lock);
+    uint64_t now = now_us();
     *out = g_telemetry;
     out->age_ms = input_age_locked();
     out->fresh = out->connected && out->age_ms < 1500;
+    out->link_age_ms = ms_since(g_link_us, now);
+    for (unsigned i = 0; i < WHEEL_BTN_COUNT; i++) out->press_count[i] = g_btn.stats[i].presses;
+    out->last_button = g_btn.last_button;
+    out->last_outcome = g_btn.last_outcome;
+    out->last_button_age_ms = ms_since(g_btn.last_button_us, now);
+    pthread_mutex_unlock(&g_wheel_lock);
+}
+
+/* Settle the button change waiting for the virtual pad update that carries it. */
+static void resolve_pending_locked(uint8_t outcome, int32_t result, uint64_t now) {
+    if (g_btn.pending < 0) return;
+    wheel_button_event_t *e = &g_btn.events[g_btn.pending];
+    e->outcome = outcome;
+    e->inject_result = result;
+    uint64_t us = now >= g_btn.pending_us ? now - g_btn.pending_us : 0;
+    e->inject_us = us > UINT32_MAX ? UINT32_MAX : (uint32_t)us;
+    for (unsigned i = 0; i < WHEEL_BTN_COUNT; i++) {
+        if (!(e->pressed & (1u << i))) continue;
+        wheel_button_stats_t *s = &g_btn.stats[i];
+        if (outcome == WHEEL_SEND_OK) s->sent_ok++;
+        else if (outcome == WHEEL_SEND_FAILED) s->send_failed++;
+        else s->not_sent++;
+    }
+    if (e->pressed) g_btn.last_outcome = outcome;
+    g_btn.pending = -1;
+}
+
+/* Record press/release edges from raw wheel bits, before any remapping. */
+static void record_buttons_locked(uint16_t held, const uint8_t *b, const ScePadData *pad,
+                                  uint8_t seq_lost, uint64_t now) {
+    uint16_t pressed = held & (uint16_t)~g_held, released = g_held & (uint16_t)~held;
+    g_held = held;
+    if (!pressed && !released) return;
+    /* A change that never reached an injection must not be counted as sent. */
+    resolve_pending_locked(WHEEL_SEND_SKIPPED, 0, now);
+    if (!g_btn.start_us) g_btn.start_us = now;
+    int slot = (int)(g_btn.total % WHEEL_EVENT_COUNT);
+    wheel_button_event_t *e = &g_btn.events[slot];
+    *e = (wheel_button_event_t){
+        .id = g_btn.total + 1, .t_ms = ms_since(g_btn.start_us, now),
+        .gap_ms = ms_since(g_last_input_us, now), .pad_buttons = pad->buttons,
+        .pressed = pressed, .released = released, .held = held,
+        .cmd = b[0], .seq = b[2], .raw4 = b[4], .raw5 = b[0] == 0x20 ? b[5] : 0,
+        .r2 = pad->analogButtons.r2, .l2 = pad->analogButtons.l2,
+        .stick_x = pad->leftStick.x, .seq_lost = seq_lost, .outcome = WHEEL_SEND_PENDING
+    };
+    for (unsigned i = 0; i < WHEEL_BTN_COUNT; i++) {
+        uint16_t bit = (uint16_t)(1u << i);
+        wheel_button_stats_t *s = &g_btn.stats[i];
+        if (pressed & bit) {
+            s->presses++;
+            g_press_us[i] = now;
+            g_btn.last_button = (int8_t)i;
+        }
+        if ((released & bit) && g_press_us[i]) {
+            s->releases++;
+            uint32_t hold = ms_since(g_press_us[i], now);
+            s->last_hold_ms = e->hold_ms = hold;
+            if (!s->min_hold_ms || hold < s->min_hold_ms) s->min_hold_ms = hold ? hold : 1;
+            g_press_us[i] = 0;
+        }
+    }
+    if (pressed) { g_btn.last_button_us = now; g_btn.last_outcome = WHEEL_SEND_PENDING; }
+    g_btn.pending = slot;
+    g_btn.pending_us = now;
+    g_btn.total++;
+}
+
+/* Wheel reports carry their own GIP sequence; captures show 255 wrapping to 1. */
+static uint8_t track_sequence_locked(uint8_t seq) {
+    uint8_t lost = 0;
+    if (g_seq_valid) {
+        unsigned step = (uint8_t)(seq - g_seq_prev);
+        if (g_seq_prev == 255 && seq == 1) step = 1;
+        if (!step) g_btn.seq_repeated++;
+        else if (step > 1) { lost = (uint8_t)(step - 1); g_btn.seq_lost += lost; }
+    }
+    g_seq_prev = seq;
+    g_seq_valid = 1;
+    return lost;
+}
+
+void wheel_buttons_get(wheel_button_report_t *out) {
+    pthread_mutex_lock(&g_wheel_lock);
+    memset(out, 0, sizeof(*out));
+    out->now_ms = ms_since(g_btn.start_us, now_us());
+    out->sessions = g_btn.sessions;
+    out->event_total = g_btn.total;
+    out->usb_polls = g_btn.usb_polls;
+    out->usb_timeouts = g_btn.usb_timeouts;
+    out->usb_discarded = g_btn.usb_discarded;
+    out->short_packets = g_btn.short_packets;
+    out->other_packets = g_btn.other_packets;
+    out->seq_lost = g_btn.seq_lost;
+    out->seq_repeated = g_btn.seq_repeated;
+    out->last_other_cmd = g_btn.last_other_cmd;
+    out->last_other_len = g_btn.last_other_len;
+    memcpy(out->buttons, g_btn.stats, sizeof(out->buttons));
+    out->event_count = g_btn.total < WHEEL_EVENT_COUNT ? g_btn.total : WHEEL_EVENT_COUNT;
+    for (uint32_t i = 0; i < out->event_count; i++)
+        out->events[i] = g_btn.events[(g_btn.total - out->event_count + i) % WHEEL_EVENT_COUNT];
+    pthread_mutex_unlock(&g_wheel_lock);
+}
+
+void wheel_buttons_reset(void) {
+    pthread_mutex_lock(&g_wheel_lock);
+    memset(&g_btn, 0, sizeof(g_btn));
+    g_btn.pending = g_btn.last_button = -1;
+    /* Releases of buttons held across the reset have no matching press. */
+    memset(g_press_us, 0, sizeof(g_press_us));
     pthread_mutex_unlock(&g_wheel_lock);
 }
 void wheel_diagnostics_get(wheel_diagnostics_t *out) {
@@ -188,7 +331,7 @@ void wheel_diagnostics_event(int stage, int32_t error) {
     g_diagnostics.stage = stage;
     if (stage == WHEEL_USB_OPEN) g_diagnostics.usb_found = 1;
     if (stage == WHEEL_HANDSHAKE) g_diagnostics.handshake_ok = 0;
-    if (stage == WHEEL_READY) g_diagnostics.handshake_ok = 1;
+    if (stage == WHEEL_READY) { g_diagnostics.handshake_ok = 1; g_btn.sessions++; }
     if (stage == WHEEL_DISCONNECTED) {
         g_diagnostics.usb_found = g_diagnostics.handshake_ok = g_diagnostics.virtual_ready = 0;
     }
@@ -201,6 +344,47 @@ void wheel_diagnostics_injection(int32_t result) {
     g_diagnostics.last_injection = result;
     g_diagnostics.virtual_ready = result == 0;
     if (result != 0) g_diagnostics.injection_errors++;
+    resolve_pending_locked(result == 0 ? WHEEL_SEND_OK : WHEEL_SEND_FAILED, result, now_us());
+    pthread_mutex_unlock(&g_wheel_lock);
+}
+/* The reader had a report but no virtual pad to send it to. */
+void wheel_diagnostics_not_sent(void) {
+    pthread_mutex_lock(&g_wheel_lock);
+    resolve_pending_locked(WHEEL_SEND_SKIPPED, 0, now_us());
+    pthread_mutex_unlock(&g_wheel_lock);
+}
+void wheel_diagnostics_usb_poll(int kind) {
+    pthread_mutex_lock(&g_wheel_lock);
+    g_btn.usb_polls++;
+    if (kind == WHEEL_POLL_TIMEOUT) g_btn.usb_timeouts++;
+    else if (kind == WHEEL_POLL_DISCARDED) g_btn.usb_discarded++;
+    /* Idle wheels only time out; without a USB error the endpoint is still open. */
+    g_link_us = now_us();
+    pthread_mutex_unlock(&g_wheel_lock);
+}
+static void apply_guide_locked(ScePadData *pad);
+static void add_extra_buttons(ScePadData *o, uint32_t extra) {
+    o->buttons |= extra;
+    if (extra & SCE_PAD_BUTTON_R2) o->analogButtons.r2 = 255;
+    if (extra & SCE_PAD_BUTTON_L2) o->analogButtons.l2 = 255;
+}
+int wheel_compose_pad(uint32_t extra, ScePadData *o) {
+    pthread_mutex_lock(&g_wheel_lock);
+    g_extra_buttons = extra;
+    int ok = g_wheel_pad_valid;
+    if (ok) {
+        *o = g_wheel_pad;
+        add_extra_buttons(o, extra);
+        apply_guide_locked(o);
+    }
+    pthread_mutex_unlock(&g_wheel_lock);
+    return ok;
+}
+void wheel_virtual_shift(int up) {
+    pthread_mutex_lock(&g_wheel_lock);
+    if (up && g_gear < 8) g_gear++;
+    if (!up && g_gear > -1) g_gear--;
+    g_telemetry.gear = g_gear;
     pthread_mutex_unlock(&g_wheel_lock);
 }
 int wheel_set_gear(int gear) {
@@ -336,10 +520,12 @@ void wheel_reset_state(void) {
     g_filter_valid = 0;
     g_guide_pressed = g_prev_pad_r = g_prev_pad_l = 0;
     g_gear = 1;
-    memset(&g_last_pad, 0, sizeof(g_last_pad));
-    g_last_pad.leftStick.x = g_last_pad.leftStick.y = 128;
-    g_last_pad.rightStick.x = g_last_pad.rightStick.y = 128;
-    g_last_pad.quat.w = 1.0f;
+    resolve_pending_locked(WHEEL_SEND_SKIPPED, 0, now_us());
+    g_held = 0;
+    g_seq_valid = 0;
+    g_link_us = 0;
+    memset(g_press_us, 0, sizeof(g_press_us));
+    g_wheel_pad_valid = 0;
     memset(&g_telemetry, 0, sizeof(g_telemetry));
     g_telemetry.gear = 1;
     pthread_mutex_unlock(&g_wheel_lock);
@@ -409,8 +595,21 @@ static void record_input_locked(uint64_t now) {
     }
 }
 
+static uint16_t wheel_held_bits(uint8_t b4, uint8_t b5) {
+    static const struct { uint8_t byte, mask, button; } bits[] = {
+        {4, 0x10, WHEEL_BTN_A}, {4, 0x20, WHEEL_BTN_B}, {4, 0x40, WHEEL_BTN_X}, {4, 0x80, WHEEL_BTN_Y},
+        {4, 0x04, WHEEL_BTN_MENU}, {4, 0x08, WHEEL_BTN_VIEW},
+        {5, 0x01, WHEEL_BTN_UP}, {5, 0x02, WHEEL_BTN_DOWN}, {5, 0x04, WHEEL_BTN_LEFT}, {5, 0x08, WHEEL_BTN_RIGHT},
+        {5, 0x10, WHEEL_BTN_PADDLE_L}, {5, 0x20, WHEEL_BTN_PADDLE_R}
+    };
+    uint16_t held = 0;
+    for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
+        if ((bits[i].byte == 4 ? b4 : b5) & bits[i].mask) held |= (uint16_t)(1u << bits[i].button);
+    return held;
+}
+
 /* Parse do pacote GIP (cmd=0x20) do Ferrari 458 Spider */
-static void parse_input_locked(const uint8_t *b, ScePadData *o) {
+static void parse_input_locked(const uint8_t *b, ScePadData *o, uint8_t seq_lost) {
     uint8_t  b4     = b[4];
     uint8_t  b5     = b[5];
     uint16_t steer  = (uint16_t)b[6]  | ((uint16_t)b[7]  << 8);
@@ -466,8 +665,12 @@ static void parse_input_locked(const uint8_t *b, ScePadData *o) {
     o->buttons   = btn;
     o->connected = 1;
     o->quat.w    = 1.0f;
-    g_last_pad = *o;
+    g_wheel_pad = *o;
+    g_wheel_pad_valid = 1;
+    add_extra_buttons(o, g_extra_buttons);
     apply_guide_locked(o);
+    uint16_t held = wheel_held_bits(b4, b5) | (g_held & (1u << WHEEL_BTN_XBOX));
+    record_buttons_locked(held, b, o, seq_lost, now);
 
     /* Controle de marchas inteligente com base nas borboletas */
     uint8_t cur_pad_r = (b5 & 0x20u) ? 1 : 0;
@@ -513,7 +716,7 @@ static void parse_input_locked(const uint8_t *b, ScePadData *o) {
 void wheel_parse_input(const uint8_t *b, ScePadData *o) {
     if (!b || !o) return;
     pthread_mutex_lock(&g_wheel_lock);
-    parse_input_locked(b, o);
+    parse_input_locked(b, o, 0);
     pthread_mutex_unlock(&g_wheel_lock);
 }
 
@@ -552,39 +755,57 @@ int wheel_gip_handshake(int fd, struct usb_fs_endpoint *eps) {
 int wheel_handle_packet(int fd, struct usb_fs_endpoint *eps,
                         const uint8_t *buf, uint32_t len,
                         ScePadData *out_pad) {
-    if (!buf || !out_pad || len < 4 || len > 64) return 0;
-    uint8_t cmd = buf[0];
+    if (!buf || !out_pad) return 0;
+    uint8_t cmd = len ? buf[0] : 0;
+    int malformed = len < 4 || len > 64;
+    if (!malformed) {
+        int ack_result = send_ack_wheel(fd, eps, buf, len);
+        if (ack_result != 0) return ack_result;
+    }
+    /* Input that is too short is dropped; count it so lost buttons can be traced. */
+    if (malformed || (cmd == 0x20 && len < 12) || (cmd == 0x07 && len < 5)) {
+        pthread_mutex_lock(&g_wheel_lock);
+        g_btn.short_packets++;
+        pthread_mutex_unlock(&g_wheel_lock);
+        return 0;
+    }
 
-    int ack_result = send_ack_wheel(fd, eps, buf, len);
-    if (ack_result != 0) return ack_result;
-
-    if (cmd == 0x20 && len >= 12) {
+    if (cmd == 0x20) {
         pthread_mutex_lock(&g_wheel_lock);
         if (g_input_count < 6) g_input_count++;
-        parse_input_locked(buf, out_pad);
+        parse_input_locked(buf, out_pad, track_sequence_locked(buf[2]));
         pthread_mutex_unlock(&g_wheel_lock);
         return 1;
     }
 
     /* Pacote Guide / Xbox button (cmd=0x07) */
-    if (cmd == 0x07 && len >= 5) {
+    if (cmd == 0x07) {
         pthread_mutex_lock(&g_wheel_lock);
         g_guide_pressed = g_input_count > 5 && (buf[4] & 0x01u);
-        *out_pad = g_last_pad;
-        apply_guide_locked(out_pad);
+        int connected = g_wheel_pad_valid;
+        if (connected) {
+            *out_pad = g_wheel_pad;
+            add_extra_buttons(out_pad, g_extra_buttons);
+            apply_guide_locked(out_pad);
+        }
         g_telemetry.btn_xbox = g_guide_pressed;
         g_telemetry.buttons = out_pad->buttons;
-        int connected = g_last_pad.connected;
-        if (connected) record_input_locked(now_us());
+        if (connected) {
+            uint64_t now = now_us();
+            uint16_t held = (uint16_t)((g_held & ~(1u << WHEEL_BTN_XBOX)) | (g_guide_pressed ? 1u << WHEEL_BTN_XBOX : 0));
+            record_buttons_locked(held, buf, out_pad, 0, now);
+            record_input_locked(now);
+        }
         pthread_mutex_unlock(&g_wheel_lock);
         if (!connected) return 0;
         return 1;
     }
 
-    /* Pacote de anuncio ou status */
-    if (cmd == 0x02 || cmd == 0x03) {
-        return 0;
-    }
-
+    /* Anuncio, status e outros pacotes nao alteram o controle virtual. */
+    pthread_mutex_lock(&g_wheel_lock);
+    g_btn.other_packets++;
+    g_btn.last_other_cmd = cmd;
+    g_btn.last_other_len = (uint8_t)len;
+    pthread_mutex_unlock(&g_wheel_lock);
     return 0;
 }
