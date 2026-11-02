@@ -382,16 +382,22 @@ int wheel_compose_pad(uint32_t extra, ScePadData *o) {
     pthread_mutex_unlock(&g_wheel_lock);
     return ok;
 }
-/* Called while the wheel sends nothing: a stuck Guide must be released even when no
- * report follows it. Returns 1 with the pad to send when that happened. */
+/* Called while the wheel sends nothing. A real DualSense never stops reporting; a
+ * virtual pad left silent goes idle on the PS5 and the game drops the first commands
+ * after the pause, so the last state is sent again. A stuck Guide is released here
+ * too, since no report may follow it. Returns 1 with the pad to send. */
 int wheel_idle_pad(ScePadData *o) {
     static const uint8_t guide_up[6] = {0x07, 0, 0, 0, 0, 0};
     pthread_mutex_lock(&g_wheel_lock);
     uint64_t now = now_us();
-    int send = guide_expire_locked(now) && g_wheel_pad_valid;
+    int released = guide_expire_locked(now);
+    int send = g_wheel_pad_valid;
     if (send) {
         *o = g_wheel_pad;
         add_extra_buttons(o, g_extra_buttons);
+        apply_guide_locked(o);
+    }
+    if (send && released) {
         g_telemetry.buttons = o->buttons;
         record_buttons_locked((uint16_t)(g_held & ~(1u << WHEEL_BTN_XBOX)), guide_up, o, 0, now);
     }

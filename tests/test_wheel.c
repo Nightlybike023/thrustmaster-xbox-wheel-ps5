@@ -100,11 +100,12 @@ int main(int argc, char **argv) {
     /* A lost Guide release must not leave PS held: an idle wheel lets it go by itself. */
     ScePadData idle;
     guide[4] = 1; report(guide, sizeof(guide));
-    assert(!wheel_idle_pad(&idle));
+    /* While idle the last state keeps going out so the PS5 never sees a silent pad. */
+    assert(wheel_idle_pad(&idle) && (idle.buttons & SCE_PAD_BUTTON_PS) && idle.leftStick.x == 192);
     usleep(2050000);
     assert(wheel_idle_pad(&idle) && !(idle.buttons & SCE_PAD_BUTTON_PS) && idle.leftStick.x == 192);
     wheel_telemetry_get(&guide_telemetry); assert(!guide_telemetry.btn_xbox);
-    assert(!wheel_idle_pad(&idle));
+    assert(wheel_idle_pad(&idle) && !(idle.buttons & SCE_PAD_BUTTON_PS));
     out = report(input, sizeof(input));
     assert(!(out.buttons & SCE_PAD_BUTTON_PS));
     /* The same release when the next thing the wheel sends is a normal report. */
