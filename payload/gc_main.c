@@ -569,7 +569,11 @@ main_loop: ;
             goto reinit;
         }
         if (eps[0].status == USB_ERR_TIMEOUT) {
-            if (pid == PID_WHEEL) wheel_diagnostics_usb_poll(WHEEL_POLL_TIMEOUT);
+            if (pid == PID_WHEEL) {
+                wheel_diagnostics_usb_poll(WHEEL_POLL_TIMEOUT);
+                ScePadData idle;
+                if (wheel_idle_pad(&idle)) inject_pad(slot, &idle);
+            }
             continue;
         }
         if (eps[0].status != USB_ERR_NORMAL_COMPLETION) {

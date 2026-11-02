@@ -144,6 +144,7 @@ int wheel_set_gear(int gear);
  * has sent a report, so nothing is injected without a wheel. */
 int wheel_compose_pad(uint32_t extra, ScePadData *out);
 /* Count a shift from the PS Move in the gear indicator, like a paddle press. */
+int wheel_idle_pad(ScePadData *out);
 void wheel_virtual_shift(int up);
 void wheel_diagnostics_get(wheel_diagnostics_t *out);
 void wheel_diagnostics_event(int stage, int32_t error);

@@ -97,6 +97,22 @@ int main(int argc, char **argv) {
     assert(guide_telemetry.fresh && guide_telemetry.btn_xbox);
     assert(guide_after.input_packets == guide_before.input_packets + 1);
     guide[4] = 0; report(guide, sizeof(guide));
+    /* A lost Guide release must not leave PS held: an idle wheel lets it go by itself. */
+    ScePadData idle;
+    guide[4] = 1; report(guide, sizeof(guide));
+    assert(!wheel_idle_pad(&idle));
+    usleep(2050000);
+    assert(wheel_idle_pad(&idle) && !(idle.buttons & SCE_PAD_BUTTON_PS) && idle.leftStick.x == 192);
+    wheel_telemetry_get(&guide_telemetry); assert(!guide_telemetry.btn_xbox);
+    assert(!wheel_idle_pad(&idle));
+    out = report(input, sizeof(input));
+    assert(!(out.buttons & SCE_PAD_BUTTON_PS));
+    /* The same release when the next thing the wheel sends is a normal report. */
+    guide[4] = 1; report(guide, sizeof(guide));
+    usleep(2050000);
+    out = report(input, sizeof(input));
+    assert(!(out.buttons & SCE_PAD_BUTTON_PS));
+    guide[4] = 0; report(guide, sizeof(guide));
     input[4] = 0; input[5] = 0x20;
     report(input, sizeof(input)); report(input, sizeof(input));
     wheel_telemetry_t telemetry;

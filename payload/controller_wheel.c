@@ -363,6 +363,7 @@ void wheel_diagnostics_usb_poll(int kind) {
     pthread_mutex_unlock(&g_wheel_lock);
 }
 static void apply_guide_locked(ScePadData *pad);
+static int guide_expire_locked(uint64_t now);
 static void add_extra_buttons(ScePadData *o, uint32_t extra) {
     o->buttons |= extra;
     if (extra & SCE_PAD_BUTTON_R2) o->analogButtons.r2 = 255;
@@ -371,6 +372,7 @@ static void add_extra_buttons(ScePadData *o, uint32_t extra) {
 int wheel_compose_pad(uint32_t extra, ScePadData *o) {
     pthread_mutex_lock(&g_wheel_lock);
     g_extra_buttons = extra;
+    guide_expire_locked(now_us());
     int ok = g_wheel_pad_valid;
     if (ok) {
         *o = g_wheel_pad;
@@ -379,6 +381,22 @@ int wheel_compose_pad(uint32_t extra, ScePadData *o) {
     }
     pthread_mutex_unlock(&g_wheel_lock);
     return ok;
+}
+/* Called while the wheel sends nothing: a stuck Guide must be released even when no
+ * report follows it. Returns 1 with the pad to send when that happened. */
+int wheel_idle_pad(ScePadData *o) {
+    static const uint8_t guide_up[6] = {0x07, 0, 0, 0, 0, 0};
+    pthread_mutex_lock(&g_wheel_lock);
+    uint64_t now = now_us();
+    int send = guide_expire_locked(now) && g_wheel_pad_valid;
+    if (send) {
+        *o = g_wheel_pad;
+        add_extra_buttons(o, g_extra_buttons);
+        g_telemetry.buttons = o->buttons;
+        record_buttons_locked((uint16_t)(g_held & ~(1u << WHEEL_BTN_XBOX)), guide_up, o, 0, now);
+    }
+    pthread_mutex_unlock(&g_wheel_lock);
+    return send;
 }
 void wheel_virtual_shift(int up) {
     pthread_mutex_lock(&g_wheel_lock);
@@ -576,6 +594,20 @@ static uint8_t steering_output(uint16_t raw, uint64_t now) {
     return (uint8_t)(128 + x * (x < 0 ? 128 : 127) + 0.5f);
 }
 
+/* The Guide release is a single packet. When it is lost (captures on the PS5 show one
+ * press without a release) the PS button stays held and the console reads every other
+ * button as a PS shortcut, so the game ignores them. The PS5 acts on a long press well
+ * before this limit, so a real hold loses nothing. */
+#define GUIDE_MAX_HOLD_US 2000000u
+static uint64_t g_guide_us;
+
+static int guide_expire_locked(uint64_t now) {
+    if (!g_guide_pressed || now - g_guide_us < GUIDE_MAX_HOLD_US) return 0;
+    g_guide_pressed = 0;
+    g_telemetry.btn_xbox = 0;
+    return 1;
+}
+
 static void apply_guide_locked(ScePadData *pad) {
     if (!g_guide_pressed) return;
     pad->buttons |= g_wheel_cfg.btn_xbox;
@@ -668,8 +700,9 @@ static void parse_input_locked(const uint8_t *b, ScePadData *o, uint8_t seq_lost
     g_wheel_pad = *o;
     g_wheel_pad_valid = 1;
     add_extra_buttons(o, g_extra_buttons);
+    guide_expire_locked(now);
     apply_guide_locked(o);
-    uint16_t held = wheel_held_bits(b4, b5) | (g_held & (1u << WHEEL_BTN_XBOX));
+    uint16_t held = wheel_held_bits(b4, b5) | (g_guide_pressed ? 1u << WHEEL_BTN_XBOX : 0);
     record_buttons_locked(held, b, o, seq_lost, now);
 
     /* Controle de marchas inteligente com base nas borboletas */
@@ -781,7 +814,9 @@ int wheel_handle_packet(int fd, struct usb_fs_endpoint *eps,
     /* Pacote Guide / Xbox button (cmd=0x07) */
     if (cmd == 0x07) {
         pthread_mutex_lock(&g_wheel_lock);
+        uint64_t now = now_us();
         g_guide_pressed = g_input_count > 5 && (buf[4] & 0x01u);
+        if (g_guide_pressed) g_guide_us = now;
         int connected = g_wheel_pad_valid;
         if (connected) {
             *out_pad = g_wheel_pad;
@@ -791,7 +826,6 @@ int wheel_handle_packet(int fd, struct usb_fs_endpoint *eps,
         g_telemetry.btn_xbox = g_guide_pressed;
         g_telemetry.buttons = out_pad->buttons;
         if (connected) {
-            uint64_t now = now_us();
             uint16_t held = (uint16_t)((g_held & ~(1u << WHEEL_BTN_XBOX)) | (g_guide_pressed ? 1u << WHEEL_BTN_XBOX : 0));
             record_buttons_locked(held, buf, out_pad, 0, now);
             record_input_locked(now);
