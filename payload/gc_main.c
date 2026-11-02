@@ -402,7 +402,9 @@ static void *usb_hid_thread(void *arg) {
 
         buffers[0]=buf; lengths[0]=64;
         eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
-        eps[0].timeout=50; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
+        /* No timeout: an idle wheel sends one report per change, and cancelling the read
+         * every 50 ms lost some of them (a release went missing and the button stayed held). */
+        eps[0].timeout=USB_FS_TIMEOUT_NONE; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
 
         memset(&fs_open,0,sizeof(fs_open));
         fs_open.ep_index=1; fs_open.ep_no=WHEEL_EP_OUT;
@@ -551,7 +553,17 @@ main_loop: ;
         }
 
         int ok=0, cerr=0, cw=0;
-        for(cw=0;cw<(eps[0].timeout+50)*2;cw++){
+        /* Without a timeout the read stays pending for as long as the wheel is still. */
+        int unbounded = eps[0].timeout == USB_FS_TIMEOUT_NONE;
+        for(cw=0;unbounded||cw<(eps[0].timeout+50)*2;cw++){
+            if (unbounded && cw == 100) {
+                cw = 0;
+                /* Every 50 ms without data: the link is alive, and the PS5 gets the
+                 * last state again like from a real controller that never goes quiet. */
+                wheel_diagnostics_usb_poll(WHEEL_POLL_TIMEOUT);
+                ScePadData idle;
+                if (wheel_idle_pad(&idle)) inject_pad(slot, &idle);
+            }
             memset(&complete,0,sizeof(complete)); complete.ep_index=0;
             if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){
                 if (complete.ep_index != 0) continue;
