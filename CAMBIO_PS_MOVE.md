@@ -6,14 +6,14 @@ Funcionou no WRC e no Project CARS. Qualquer jogo que aceite as borboletas do vo
 
 ## O que precisa
 
-- PS5 desbloqueado rodando este driver do volante (`ps5-wheel-driver.elf`).
+- PS5 desbloqueado rodando este driver do volante (`ps5-wheel-cambio-v7.elf`, veja o [README](README.md)).
 - Volante Thrustmaster Ferrari 458 Spider no USB.
 - PS Move (CECH-ZCM1 ou ZCM2) **pareado com o PS5 por Bluetooth**. Ligar o Move no cabo USB só carrega a bateria; a leitura é sempre por Bluetooth.
 - Um suporte que segure o Move e deixe ele inclinar para frente e para trás. O protótipo usou o tubo do suporte de um projetor HY300, que já tem pivô lateral e níveis; o Move fica preso por dentro com espuma.
 
 ## Como usar
 
-1. Rode o driver e abra a página de ajustes no celular: `http://IP-do-PS5:8088/`. Toque em **Câmbio PS Move →** (ou abra `http://IP-do-PS5:8088/cambio`).
+1. Rode o driver e abra a página de ajustes no celular: `http://IP-do-PS5:8088/`. Toque no atalho **Câmbio PS Move** no topo (no cockpit, é o botão **Câmbio**), ou abra `http://IP-do-PS5:8088/cambio`.
 2. Ligue o Move (botão PS). Em poucos segundos a página mostra "PS Move conectado".
 3. Deixe o tubo parado no meio: o centro é marcado sozinho. Para refazer, segure o botão **Move** por 1 s.
 4. Empurre o tubo para frente. O ponteiro da página deve ir para o lado positivo. Se for para o lado errado, incline para frente e segure **Triângulo** por 1 s para ensinar qual é a frente.
