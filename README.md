@@ -1,4 +1,4 @@
-# Volante Ferrari 458 Spider no PS5 + câmbio PS Move
+# Volante Thrustmaster de Xbox no PS5 + câmbio PS Move
 
 Driver para usar o volante **Thrustmaster Ferrari 458 Spider** (volante de Xbox One) num **PS5 desbloqueado**. Tem também uma página de ajustes no celular, um cockpit ao vivo e um **câmbio sequencial / freio de mão feito com um PS Move**.
 
@@ -31,7 +31,7 @@ Testado no firmware **13.60** com WRC e Project CARS.
 
 ### 1. Baixe o arquivo
 
-Baixe **[`ps5-wheel-cambio-v7.elf`](https://github.com/Nightlybike023/ghostcontrol-ps5-wheel/raw/main/dist/ps5-wheel-cambio-v7.elf)**, que está na pasta [`dist/`](dist/) deste repositório.
+Baixe **[`ps5-wheel-cambio-v7.elf`](https://github.com/Nightlybike023/volante-thrustmaster-xbox-ps5/raw/main/dist/ps5-wheel-cambio-v7.elf)**, que está na pasta [`dist/`](dist/) deste repositório.
 
 Se quiser conferir que o download veio inteiro, o SHA-256 é:
 
@@ -158,7 +158,7 @@ Documentação herdada do Ghostcontrol, para outros controles USB: [ProControlle
 
 Driver for the **Thrustmaster Ferrari 458 Spider** (an Xbox One GIP wheel) on a **jailbroken PS5**, with a phone settings page, a live cockpit dashboard and a **PS Move sequential shifter / handbrake**. The game sees a regular DualSense.
 
-- **Download:** [`dist/ps5-wheel-cambio-v7.elf`](https://github.com/Nightlybike023/ghostcontrol-ps5-wheel/raw/main/dist/ps5-wheel-cambio-v7.elf). Load it with your payload loader (Payload Manager, ProsperoMgr or `nc IP 9021`), plug in the wheel, then open `http://PS5-IP:8088`.
+- **Download:** [`dist/ps5-wheel-cambio-v7.elf`](https://github.com/Nightlybike023/volante-thrustmaster-xbox-ps5/raw/main/dist/ps5-wheel-cambio-v7.elf). Load it with your payload loader (Payload Manager, ProsperoMgr or `nc IP 9021`), plug in the wheel, then open `http://PS5-IP:8088`.
 - **Built on [Ghostcontrol](https://github.com/srbraboo/Ghostcontrol-PS5-USB-Controller-Patcher) by StonedModder.** It provides the virtual DualSense, the user binding and the USB takeover: about 59% of the C lines, mostly `shellui_pad.c`. The original history and authors are kept in this repository.
 - **New in this project:** the GIP wheel driver, the PS Move shifter, the web server and pages, and the tests.
 - **[XboxWheelCompatibility](https://github.com/camren-m/XboxWheelCompatibility) by camren-m** (Windows, MIT) showed this wheel works when it is read and re-injected as a standard gamepad. None of its code is used here.
